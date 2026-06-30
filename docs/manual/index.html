@@ -570,7 +570,8 @@
                 <li class="sub-item"><a href="#cmd-setup">setup</a></li>
                 
                 <li><a href="#json-format">4b. JSON Output Format</a></li>
-                
+                <li><a href="#verbosity">4c. Verbosity (-v / -vv / -vvv)</a></li>
+
                 <li><a href="#modules">5. The Arsenal (32 Modules)</a></li>
                 <li class="sub-item"><a href="#mod-recon">Phase 1: Reconnaissance</a></li>
                 <li class="sub-item"><a href="#mod-weap">Phase 2: Weaponization</a></li>
@@ -678,12 +679,13 @@ beatrix config --set ai.model claude-3-5-sonnet-20241022</code></pre>
                 <h3 id="auth-config">Authentication Configuration</h3>
                 <p>Beatrix supports <strong>authenticated scanning</strong> through a unified auth system. Credentials flow automatically to all scanners — nuclei gets <code>-H</code> flags, IDOR gets dual-user sessions, the crawler gets cookies for authenticated crawling.</p>
 
-                <p><strong>Four credential sources</strong> (highest priority wins):</p>
+                <p><strong>Five credential sources</strong> (highest priority wins):</p>
                 <ol>
                     <li><strong>CLI flags:</strong> <code>--cookie</code>, <code>--header</code>, <code>--token</code>, <code>--auth-user</code>, <code>--auth-pass</code>, <code>--login-user</code>, <code>--login-pass</code>, <code>--login-url</code></li>
                     <li><strong>Environment variables:</strong> <code>BEATRIX_AUTH_TOKEN</code>, <code>BEATRIX_AUTH_COOKIE</code>, <code>BEATRIX_AUTH_HEADER</code>, <code>BEATRIX_AUTH_USER</code>, <code>BEATRIX_AUTH_PASS</code>, <code>BEATRIX_LOGIN_USER</code>, <code>BEATRIX_LOGIN_PASS</code>, <code>BEATRIX_LOGIN_URL</code></li>
                     <li><strong>Config file:</strong> <code>~/.beatrix/auth.yaml</code> (or <code>--auth-config /path/to/file</code>)</li>
                     <li><strong>Auto-login:</strong> <code>beatrix auth login TARGET</code> — interactive wizard saves credentials to the config file</li>
+                    <li><strong>HAR / session import:</strong> <code>beatrix auth import TARGET FILE</code> — imports a session from a browser HAR export or cookie string file</li>
                 </ol>
 
                 <h4 id="auto-login">Auto-Login (Burp Suite-style)</h4>
@@ -719,11 +721,11 @@ beatrix hunt target.com</code></pre>
                 </div>
 
                 <div class="pro-tip">
-                    <strong>OTP / 2FA:</strong> For sites that require OTP verification on every login (e.g., example.com), Beatrix detects the challenge and prompts for the code. If auto-login can't handle the site's auth flow (CAPTCHA, complex 2FA, WAF), use <code>beatrix auth browser TARGET</code> to log in manually via a real browser, or pass cookies directly with <code>--cookie</code>.
+                    <strong>OTP / 2FA:</strong> For sites that require OTP verification on every login, Beatrix detects the challenge and prompts for the code. If auto-login can't handle the site's auth flow (CAPTCHA, complex 2FA, WAF), use <code>beatrix auth browser TARGET</code> to log in manually via a real browser, or export a HAR file and run <code>beatrix auth import TARGET session.har</code>. In headless environments, pass cookies directly with <code>--cookie</code> — copy the full <code>Cookie:</code> request header from <strong>DevTools → Network</strong> (not Application → Cookies, which omits HttpOnly cookies).
                 </div>
 
                 <div class="pro-tip">
-                    <strong>Sessions:</strong> Authenticated sessions are saved to <code>~/.beatrix/sessions/</code> and reused for 24 hours. Use <code>beatrix auth sessions</code> to list saved sessions, <code>--clear DOMAIN</code> to remove one, or <code>--clear-all</code> to wipe them. Use <code>--fresh-login</code> on a hunt to force re-authentication.
+                    <strong>Sessions:</strong> Authenticated sessions are saved to <code>~/.beatrix/sessions/</code> and reused for 24 hours. If the session contains a JWT, the token's <code>exp</code> claim is checked on every load — sessions expiring within 5 minutes are discarded automatically. Use <code>beatrix auth sessions</code> to list saved sessions, <code>--clear DOMAIN</code> to remove one, or <code>--clear-all</code> to wipe them. Use <code>--fresh-login</code> on a hunt to force re-authentication.
                 </div>
 
                 <h4>Static Credentials (Manual)</h4>
@@ -779,7 +781,7 @@ idor:
     headers:
       Authorization: "Bearer user2-token"</code></pre>
 
-                <p><strong>Step 3:</strong> To get each user's session values, log in as each user separately using the browser method and copy the cookies from DevTools (Application → Cookies):</p>
+                <p><strong>Step 3:</strong> To get each user's session values, log in as each user separately. Use <code>beatrix auth browser</code> to capture sessions automatically, or go to <strong>DevTools → Network</strong>, click an authenticated request, and copy the full <code>Cookie:</code> header value (the Network tab captures HttpOnly cookies that the Application → Cookies panel misses):</p>
                 <pre><code># Log in as user1, copy session cookies from DevTools
 beatrix auth browser example.com
 
@@ -996,6 +998,7 @@ beatrix github-recon target-corp --quick -o github_report.md</code></pre>
                         <p>Surgical precision. Execute one specific scanner against a specific URL. Perfect for when you've manually found an interesting endpoint.</p>
                         <table class="flag-table">
                             <tr><td>-m, --module MODULE</td><td><strong>(Required)</strong> Module to execute</td></tr>
+                            <tr><td>-v, --verbose</td><td>Verbosity level — stackable: <code>-v</code>, <code>-vv</code>, <code>-vvv</code>. See <a href="#verbosity">4c. Verbosity</a> for full details.</td></tr>
                         </table>
                         <pre><code># Test for IDOR on a specific API endpoint
 beatrix strike https://api.example.com/v1/users -m idor
@@ -1004,7 +1007,10 @@ beatrix strike https://api.example.com/v1/users -m idor
 beatrix strike https://api.target.com/v2/account -m cors
 
 # Test for SQL injection
-beatrix strike https://shop.example.com/search?q=test -m injection</code></pre>
+beatrix strike https://shop.example.com/search?q=test -m injection
+
+# Full debug output — see every request, payload, and tool line as it happens
+beatrix strike https://api.example.com/v1/users -m injection -vvv</code></pre>
                     </div>
                 </details>
 
@@ -1031,6 +1037,7 @@ beatrix hunt -f TARGETS_FILE [OPTIONS]</code></pre>
                             <tr><td>--login-url URL</td><td>Explicit login endpoint URL (skips auto-discovery)</td></tr>
                             <tr><td>--manual-login</td><td>Open browser for manual login (for sites with OTP/CAPTCHA)</td></tr>
                             <tr><td>--fresh-login</td><td>Ignore saved session and re-authenticate</td></tr>
+                            <tr><td>-v, --verbose</td><td>Verbosity level — stackable: <code>-v</code>, <code>-vv</code>, <code>-vvv</code>. See <a href="#verbosity">4c. Verbosity</a> for full details.</td></tr>
                         </table>
                         <p><strong>Available Presets:</strong></p>
                         <table>
@@ -1075,7 +1082,13 @@ beatrix hunt target.com --auth-config ~/my-auth.yaml
 beatrix hunt -f targets.txt
 
 # File-based hunt with full preset and reports
-beatrix hunt -f targets.txt --preset full -o ./reports</code></pre>
+beatrix hunt -f targets.txt --preset full -o ./reports
+
+# Full debug output — stream every tool line, finding detail, and internal log in real time
+beatrix hunt example.com --preset full -vvv
+
+# Redirect stdout to file while keeping verbosity (useful for long scans)
+beatrix hunt example.com --preset full -vvv -o results.json > scan.log</code></pre>
                     </div>
                 </details>
 
@@ -1295,6 +1308,7 @@ beatrix mobile analyze capture.json --secrets known_keys.json</code></pre>
                         <pre><code>beatrix auth init [--force]
 beatrix auth login TARGET
 beatrix auth browser TARGET
+beatrix auth import TARGET FILE [--format {har,cookie,auto}]
 beatrix auth sessions [--clear DOMAIN] [--clear-all]
 beatrix auth show [-t TARGET]
 beatrix auth config</code></pre>
@@ -1304,7 +1318,8 @@ beatrix auth config</code></pre>
                             <tr><td><code>init</code></td><td><code>beatrix auth init</code></td><td>Generate sample auth config (~/.beatrix/auth.yaml)</td></tr>
                             <tr><td><code>login</code></td><td><code>beatrix auth login example.com</code></td><td>Interactive login wizard — store username/email &amp; password for auto-login</td></tr>
                             <tr><td><code>idor</code></td><td><code>beatrix auth idor example.com</code></td><td>Interactive wizard — set up dual credentials for IDOR scanning</td></tr>
-                            <tr><td><code>browser</code></td><td><code>beatrix auth browser example.com</code></td><td>Manual browser login — log in yourself, Beatrix captures the session</td></tr>
+                            <tr><td><code>browser</code></td><td><code>beatrix auth browser example.com</code></td><td>Manual browser login — log in yourself, Beatrix captures the complete session (including HttpOnly cookies)</td></tr>
+                            <tr><td><code>import</code></td><td><code>beatrix auth import example.com session.har</code></td><td>Import a session from a HAR file or cookie string — captures all headers exactly as they appeared</td></tr>
                             <tr><td><code>sessions</code></td><td><code>beatrix auth sessions</code></td><td>List, clear, or manage saved sessions</td></tr>
                             <tr><td><code>show</code></td><td><code>beatrix auth show -t example.com</code></td><td>Show current auth state for a target</td></tr>
                             <tr><td><code>config</code></td><td><code>beatrix auth config</code></td><td>Open auth.yaml in your default editor</td></tr>
@@ -1337,17 +1352,39 @@ beatrix hunt example.com</code></pre>
 
                         <h4>Manual Browser Login</h4>
                         <pre><code># Open a browser, log in manually, Beatrix captures your session
-beatrix auth browser example.com
-
-# In headless environments (codespaces), falls back to cookie-paste prompt
+# (uses Playwright storage_state — captures all cookies including HttpOnly,
+#  plus localStorage and sessionStorage tokens)
 beatrix auth browser example.com
 
 # Or pass cookies directly from your browser's DevTools
 beatrix hunt example.com --cookie "session=abc123" --cookie "XSRF-TOKEN=xyz"</code></pre>
-                        <p>In environments without a display (e.g., GitHub Codespaces), the browser command falls back to a cookie-paste prompt — open the target site in your local browser, copy cookies from DevTools (Application → Cookies), and paste them in <code>name=value; name2=value2</code> format.</p>
+                        <p>In environments without a display (e.g., GitHub Codespaces), the browser command falls back to a cookie-paste prompt. To capture all cookies including HttpOnly ones, open the target in your local browser, go to <strong>DevTools → Network</strong>, click any authenticated request, and copy the full <code>Cookie:</code> request header value. Avoid <strong>Application → Storage → Cookies</strong> — that panel misses HttpOnly cookies.</p>
+
+                        <h4>HAR Import</h4>
+                        <p>The fastest way to hand Beatrix a fully authenticated session is to export a HAR file from your browser and import it directly. This captures all cookies (including HttpOnly), Authorization headers, and API keys exactly as they appeared in live requests.</p>
+                        <pre><code># 1. Log in with your browser normally
+# 2. DevTools → Network → right-click any request → "Save all as HAR with content"
+# 3. Import into Beatrix
+beatrix auth import example.com session.har
+
+# Also accepts a plain text cookie string
+beatrix auth import example.com cookies.txt
+
+# Force explicit format detection
+beatrix auth import example.com dump.txt --format cookie
+
+# Verify the imported session
+beatrix auth show -t example.com</code></pre>
+                        <table class="flag-table">
+                            <tr><th>Flag</th><th>Description</th></tr>
+                            <tr><td><code>TARGET</code></td><td>Domain to associate the session with (e.g. <code>example.com</code>)</td></tr>
+                            <tr><td><code>FILE</code></td><td>Path to a <code>.har</code> file or plain-text cookie string file</td></tr>
+                            <tr><td><code>--format {har,cookie,auto}</code></td><td>Force format detection; defaults to <code>auto</code> (inferred from file extension and content)</td></tr>
+                        </table>
+                        <p>Beatrix scores every entry in the HAR by URL (preferring authenticated API calls over static assets), extracts the best <code>Cookie</code> header, any <code>Authorization: Bearer</code> token, and <code>X-Api-Key</code> / <code>X-Auth-Token</code> headers, then saves the result as a normal session file that all scanners pick up automatically.</p>
 
                         <h4>Session Persistence</h4>
-                        <p>Once authenticated (via auto-login, OTP flow, or manual browser), sessions are saved to <code>~/.beatrix/sessions/&lt;domain&gt;.json</code> and reused for 24 hours — no re-authentication needed on repeat scans.</p>
+                        <p>Once authenticated (via auto-login, OTP flow, manual browser, or HAR import), sessions are saved to <code>~/.beatrix/sessions/&lt;domain&gt;.json</code> and reused for 24 hours — no re-authentication needed on repeat scans. If the session contains a JWT, Beatrix additionally decodes the token's <code>exp</code> claim on every load — a token expiring within 5 minutes is discarded automatically so stale sessions never reach scanners.</p>
                         <pre><code># List all saved sessions
 beatrix auth sessions
 
@@ -1554,6 +1591,64 @@ beatrix polyglot clobber</code></pre>
                     <li>The <code>validate</code> command accepts both this envelope format and bare finding lists (<code>[...]</code>) for backward compatibility.</li>
                     <li><code>findings export --fmt jsonl</code> produces newline-delimited JSON (one finding per line) without the envelope.</li>
                 </ul>
+            </section>
+
+            <section id="verbosity">
+                <h2>4c. Verbosity (-v / -vv / -vvv)</h2>
+                <p>Both <code>hunt</code> and <code>strike</code> accept a <code>-v</code> flag that stacks up to three levels. The flag controls how much detail is printed to the terminal during a scan. By default, Beatrix shows phase transitions, scanner names, and findings as they arrive. Each additional <code>-v</code> exposes a lower layer of the stack.</p>
+
+                <h3>Level Summary</h3>
+                <table>
+                    <tr><th>Flag</th><th>What Changes</th></tr>
+                    <tr>
+                        <td><code>-v</code></td>
+                        <td>Log buffer raised from 50 to 200 entries. All <code>info</code> events emitted by scanners are shown. Useful when you want phase and scanner output without losing lines mid-scan on busy targets.</td>
+                    </tr>
+                    <tr>
+                        <td><code>-vv</code></td>
+                        <td>Log buffer raised to 500 entries. Each finding expands inline as it is discovered, showing the URL, the vulnerable parameter, and up to 500 characters of evidence. Scanner errors are promoted from dimmed to red, making them easier to spot.</td>
+                    </tr>
+                    <tr>
+                        <td><code>-vvv</code></td>
+                        <td>Unlimited log buffer. Evidence truncation raised to 5,000 characters per finding. Python's <code>logging</code> module is configured at <code>DEBUG</code> level with a Rich handler, routing all internal scanner debug output to the terminal. Every external tool subprocess streams its raw stdout and stderr line by line in real time as the process runs.</td>
+                    </tr>
+                </table>
+
+                <h3>-vvv: External Tool Streaming</h3>
+                <p>At <code>-vvv</code>, Beatrix switches from buffered subprocess collection to async line-by-line streaming for all 13 external tool runners. Each line is prefixed with the tool name so output from concurrent tools is distinguishable. Tools that normally suppress output have their silence flags removed:</p>
+                <ul>
+                    <li><strong>amass</strong> — <code>-v</code> flag added; outputs each data source query and discovered subdomain as it happens rather than only at completion</li>
+                    <li><strong>katana</strong> — <code>-silent -nc</code> removed; crawl progress and discovered URLs stream in real time</li>
+                    <li><strong>gospider</strong> — <code>-q</code> removed</li>
+                    <li><strong>whatweb</strong> — <code>-q</code> removed; fingerprinting detail shown per request</li>
+                    <li><strong>dirsearch</strong> — <code>-q</code> removed; discovered paths print as they are found</li>
+                    <li><strong>dalfox</strong> — <code>--silence</code> removed; XSS testing activity shown per payload</li>
+                </ul>
+                <p>The output lines are labeled by logger name, for example:</p>
+                <pre><code>[beatrix.tools.amass] [out] admin.example.com
+[beatrix.tools.amass] [out] api.example.com
+[beatrix.tools.katana] [out] https://example.com/api/v2/users
+[beatrix.tools.dalfox] [err] [INFO] target: https://example.com/search?q=test</code></pre>
+
+                <h3>Usage</h3>
+                <pre><code># Level 1 — more info events, larger buffer
+beatrix hunt example.com -v
+
+# Level 2 — inline finding details as discovered
+beatrix hunt example.com -vv
+
+# Level 3 — full debug, streaming tool output
+beatrix hunt example.com --preset full -vvv
+
+# Strike with full debug
+beatrix strike https://api.example.com -m injection -vvv
+
+# Redirect all output to a log file (useful for long full-preset scans)
+beatrix hunt example.com --preset full -vvv -o results.json > scan.log</code></pre>
+
+                <div class="warning">
+                    <strong>Note:</strong> At <code>-vvv</code>, output volume is high. For long scans (especially <code>--preset full</code> with amass running), redirecting stdout to a file (<code>&gt; scan.log</code>) and tailing it separately is the more practical workflow.
+                </div>
             </section>
 
             <section id="modules">

@@ -1,71 +1,60 @@
-# ⚔️ BEATRIX CLI — The Black Mamba
+# BEATRIX CLI — The Black Mamba
 
 > *"Revenge is a dish best served with a working PoC."*
 
 **License:** Source Available — Free for non-commercial use. Commercial use requires a separate license. See [LICENSE](LICENSE).
 
-A command-line bug bounty hunting framework. 32 scanner modules, 13 external tool integrations, full OWASP Top 10 coverage, 7-phase Kill Chain methodology, and AI-assisted analysis — all from your terminal. Targets can be domains, URLs, or raw IP addresses.
-
-Globally installable on any Linux system. Call it from anywhere.
-
----
-<img src="beatrix.gif" width="1920" alt="Demo GIF">
+A command-line bug bounty hunting framework. 32 scanner modules, 13 external tool integrations, full OWASP Top 10 coverage, a 7-phase Kill Chain methodology, and AI-assisted analysis. Targets can be domains, URLs, or raw IP addresses.
 
 ---
 
-## 📖 The Manual
+<img src="beatrix.gif" width="1920" alt="Demo">
 
-Beatrix ships with an interactive, comprehensive HTML manual covering every command, every module, all flags, presets, and real-world workflows:
+---
+
+## The Manual
+
+Beatrix ships with an interactive HTML manual covering every command, every module, all flags, presets, and real-world workflows:
 
 ```bash
 beatrix manual
 ```
 
-This opens the full manual in your default browser — no internet required. You can also open it directly at [`docs/manual/index.html`](docs/manual/index.html).
+Opens in your default browser — no internet required. Also available at [`docs/manual/index.html`](docs/manual/index.html).
 
 ---
 
-## Install (One Command)
+## Installation
 
 ```bash
 git clone https://github.com/SudoPacman-Syuu/Beatrix.git && cd Beatrix && ./install.sh
 ```
 
-That's it. The installer auto-detects your Python, picks the best install method, puts `beatrix` on your PATH, and **automatically installs all 21 external security tools** (nuclei, nmap, sqlmap, subfinder, ffuf, etc.).
+The installer auto-detects your Python, selects the best install method, puts `beatrix` on your PATH, and installs all 21 external security tools (nuclei, nmap, sqlmap, subfinder, ffuf, and others).
 
-### Install Method Priority
+**Install method priority:**
 
-The installer automatically selects the best method in this order:
-
-1. **uv** (fastest, recommended) — auto-installed if missing
-2. **venv** — Python built-in virtual environment at `~/.beatrix`
+1. **uv** (fastest) — auto-installed if missing
+2. **venv** — Python virtual environment at `~/.beatrix`
 3. **pipx** — isolated app install
-4. **pip --user** — user-level fallback
+4. **pip --user** — fallback
+
+Alternative methods:
 
 ```bash
-# Using make
-git clone https://github.com/SudoPacman-Syuu/Beatrix.git && cd Beatrix
-make install
-
-# Using uv directly
-uv tool install .
-
-# Using pipx
-pipx install .
-
-# Dedicated venv + symlink to /usr/local/bin
-make install-venv
-
-# For development
-make install-dev
+make install            # same as ./install.sh via make
+make install-dev        # editable install for development
+uv tool install .       # direct uv install
+pipx install .          # direct pipx install
+make install-venv       # dedicated venv + symlink to /usr/local/bin
 ```
 
-Customize the venv location: `BEATRIX_VENV=~/my-venv ./install.sh`
+Custom venv location: `BEATRIX_VENV=~/my-venv ./install.sh`
 
-### Uninstall
+**Uninstall:**
 
 ```bash
-./uninstall.sh        # or: make uninstall
+./uninstall.sh    # or: make uninstall
 ```
 
 ---
@@ -76,28 +65,28 @@ Customize the venv location: `BEATRIX_VENV=~/my-venv ./install.sh`
 beatrix                              # show all commands
 beatrix hunt example.com             # scan a domain
 beatrix hunt 192.168.1.1             # scan an IP address
-beatrix hunt -f targets.txt          # hunt all URLs from a file
-beatrix strike api.com -m cors       # single module attack
+beatrix hunt -f targets.txt          # scan all targets from a file
+beatrix strike api.com -m cors       # single module, single target
 beatrix help hunt                    # detailed command help
 beatrix arsenal                      # full module reference
 ```
 
 ---
 
-## The Death List — Command Reference
+## Command Reference
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `hunt TARGET` | Full vulnerability scan | `beatrix hunt example.com` or `beatrix hunt 10.0.0.1` |
-| `hunt -f FILE` | Hunt targets from file | `beatrix hunt -f targets.txt` |
-| `strike TARGET -m MOD` | Single module attack | `beatrix strike api.com -m cors` |
+| `hunt TARGET` | Full vulnerability scan | `beatrix hunt example.com` |
+| `hunt -f FILE` | Scan targets from file | `beatrix hunt -f targets.txt` |
+| `strike TARGET -m MOD` | Single module against a target | `beatrix strike api.com -m cors` |
 | `probe TARGET` | Quick alive check | `beatrix probe example.com` |
-| `recon DOMAIN` | Reconnaissance | `beatrix recon example.com --deep` |
-| `batch FILE -m MOD` | Mass scanning | `beatrix batch targets.txt -m cors` |
+| `recon DOMAIN` | Reconnaissance only | `beatrix recon example.com --deep` |
+| `batch FILE -m MOD` | Mass single-module scanning | `beatrix batch targets.txt -m cors` |
 | `bounty-hunt TARGET` | OWASP Top 10 pipeline | `beatrix bounty-hunt https://api.com` |
 | `rapid` | Multi-target quick sweep | `beatrix rapid -d example.com` |
 | `haiku-hunt TARGET` | AI-assisted hunting | `beatrix haiku-hunt example.com` |
-| `ghost TARGET` | AI autonomous pentester | `beatrix ghost https://api.com` |
+| `ghost TARGET` | Autonomous AI pentester | `beatrix ghost https://api.com` |
 | `github-recon ORG` | GitHub secret scanner | `beatrix github-recon acme-corp` |
 | `validate FILE` | Validate findings | `beatrix validate report.json` |
 | `mobile [sub]` | Mobile traffic intercept | `beatrix mobile intercept` |
@@ -106,32 +95,32 @@ beatrix arsenal                      # full module reference
 | `origin-ip DOMAIN` | Origin IP behind CDN | `beatrix origin-ip example.com` |
 | `inject TARGET` | Deep parameter injection | `beatrix inject https://api.com --deep` |
 | `polyglot [sub]` | XSS polyglot generation | `beatrix polyglot generate` |
-| `auth [sub]` | Auth & auto-login | `beatrix auth login example.com` |
+| `auth [sub]` | Auth and auto-login | `beatrix auth login example.com` |
 | `auth browser TARGET` | Manual browser login | `beatrix auth browser example.com` |
+| `auth import TARGET FILE` | Import session from HAR or cookie string | `beatrix auth import example.com session.har` |
 | `auth sessions` | Manage saved sessions | `beatrix auth sessions --clear example.com` |
 | `config` | Configuration | `beatrix config --show` |
 | `list` | List modules/presets | `beatrix list --modules` |
 | `arsenal` | Full module reference | `beatrix arsenal` |
 | `help CMD` | Detailed command help | `beatrix help hunt` |
-| `manual` | Open HTML manual in browser | `beatrix manual` |
-| `setup` | Install all external tools | `beatrix setup` |
+| `manual` | Open HTML manual | `beatrix manual` |
+| `setup` | Install external tools | `beatrix setup` |
 
 ---
 
 ## Requirements
 
-- **Python 3.11+** (the installer checks this for you)
-- **Linux** (Debian, Ubuntu, Fedora, Arch, etc.)
-- 21 external tools are **automatically installed** by `./install.sh` and `beatrix setup`
+- **Python 3.11+**
+- **Linux** (Debian, Ubuntu, Fedora, Arch, and others)
 
-All external tools are installed automatically during setup. To reinstall or update them later:
+21 external tools are installed automatically by `./install.sh`. To reinstall or update them later:
 
 ```bash
 beatrix setup            # install all missing tools
-beatrix setup --check    # just show what's installed
+beatrix setup --check    # show what is installed
 ```
 
-### Verify installation
+Verify the installation:
 
 ```bash
 beatrix --version
@@ -140,89 +129,102 @@ beatrix list --modules
 
 ---
 
-## Core Concepts
+## Presets
 
-### The Kill Chain
-
-Every `hunt` follows the Cyber Kill Chain methodology:
-
-1. 🛡️ **CDN Bypass** — Detects Cloudflare/Akamai/Fastly/CloudFront/Sucuri/Incapsula/PerimeterX/DataDome/Kasada via IP range + header fingerprinting. Discovers origin IPs through 6+ techniques (DNS history, crt.sh SSL certs, MX records, subdomain correlation, misconfiguration checks, WHOIS). If origin found, all network scans target the real server instead of CDN edge. Optional API keys (SecurityTrails, Censys, Shodan) via environment variables.
-2. 🔍 **Reconnaissance** — Subdomain enum (`subfinder`, `amass`), crawling (`katana`, `gospider`, `hakrawler`, `gau`), **full 65535-port TCP scan** (`nmap -sS -p-`) against origin IP when available, service fingerprinting, NSE vuln/discovery/auth scripts, UDP top-50 scan, **firewall fingerprinting + bypass testing** (`scapy`), **SSH deep audit** (`paramiko`), JS analysis, endpoint probing, tech fingerprinting (`whatweb`, `webanalyze`), **nuclei recon** (fast tech/panel/WAF detection), **nuclei network** (protocol checks on non-HTTP services)
-2. ⚔️ **Weaponization** — Subdomain takeover, error disclosure, cache poisoning, prototype pollution
-3. 📦 **Delivery** — CORS, open redirects, OAuth redirect, HTTP smuggling, WebSocket testing
-4. 💥 **Exploitation** — Injection (SQLi/XSS/CMDi) with response_analyzer behavioral detection and WAF bypass fallback (11 WAF profiles, profile-aware 3-strategy retry with adaptive learning), SSRF, IDOR, BAC, auth bypass, SSTI, XXE, deserialization, GraphQL, mass assignment, business logic, ReDoS, payment, **nuclei exploit scan** (CVEs, workflows, authenticated, interactsh OOB, **WAF bypass: realistic UA, CDN-aware rate limiting, origin IP rewrite with TLS SNI**), **nuclei headless** (DOM XSS, prototype pollution). SmartFuzzer runs ffuf-verified fuzzing with profile-targeted WAF encoding on parameterized URLs. Confirmed findings are escalated to deep exploitation tools (`sqlmap`, `dalfox`, `commix`, `jwt_tool`)
-5. 🔧 **Installation** — File upload bypass, polyglot uploads, path traversal
-6. 📡 **Command & Control** — OOB callback correlation via built-in `PoCServer` (pure asyncio HTTP server, auto-binds free port) or external `interact.sh`. Blind SSRF/XXE/RCE confirmation from callbacks registered during Phase 4. `LocalPoCClient` provides offset-based dedup polling.
-7. 🎯 **Objectives** — VRT classification (Bugcrowd VRT + CVSS 3.1), exploit chain generation via PoCChainEngine (correlates ≥2 findings), finding aggregation, deduplication, impact assessment
-
-### Presets
-
-| Preset | Description | Time |
-|--------|-------------|------|
+| Preset | Description | Approximate Time |
+|--------|-------------|-----------------|
 | `quick` | Surface scan, recon only | ~5 min |
-| `standard` | Balanced scan (**default**) | ~15 min |
-| `full` | Complete kill chain + full network recon | ~45–60 min |
+| `standard` | Balanced scan (default) | ~15 min |
+| `full` | Complete kill chain + full network recon | ~45-60 min |
 | `stealth` | Low-noise passive recon | ~10 min |
 | `injection` | Injection-focused testing | ~20 min |
 | `api` | API security testing | ~15 min |
+| `web` | Web application focused | ~20 min |
+| `recon` | Reconnaissance only | ~10 min |
 
 ```bash
 beatrix hunt example.com --preset full
 beatrix hunt example.com --preset injection
 ```
 
-### IP Address Targets
+---
 
-Beatrix fully supports scanning raw IP addresses (IPv4 and IPv6). When an IP target is detected, domain-only operations are automatically skipped:
+## Verbosity
 
-- **Skipped:** Subdomain enumeration (subfinder, amass, crt.sh), origin IP discovery, GitHub recon, subdomain takeover checks
-- **Active:** All HTTP-based scanners (injection, CORS, SSRF, IDOR, XXE, etc.), port scanning, service detection, firewall testing
+Both `hunt` and `strike` accept a `-v` flag with three levels. By default, Beatrix shows phase transitions, scanner names, and findings as they arrive. The verbosity flag exposes progressively more detail without requiring any configuration changes.
 
 ```bash
-# Scan a single IP
-beatrix hunt 192.168.1.1
+beatrix hunt example.com -v       # show all info events; log buffer raised to 200
+beatrix hunt example.com -vv      # show URL, parameter, and evidence for each finding as discovered
+beatrix hunt example.com -vvv     # route all internal debug logging to the terminal in real time
 
-# Scan with full preset (includes nmap, SSH audit, firewall testing)
-beatrix hunt 10.0.0.1 --preset full
-
-# Strike a specific service on an IP
-beatrix strike http://192.168.1.1:8080/api -m injection
-
-# IP addresses also work in target files
-echo "192.168.1.1
-10.0.0.2
-https://172.16.0.1:443" > targets.txt
-beatrix hunt -f targets.txt
+beatrix strike api.com -m cors -vvv
 ```
 
-### Scanner Modules (Arsenal)
+At `-vvv`, Python's logging module is configured at DEBUG level with a Rich handler. Every internal scanner operation, every HTTP call dispatched by a scanner, and the raw stdout and stderr of all external tool subprocesses (amass, katana, gospider, dirsearch, dalfox, and others) stream to the terminal line by line as they happen. Tools that normally suppress output (using `-silent`, `-q`, or `--silence` flags) have those flags removed in this mode. Amass also receives its own `-v` flag for detailed source-level enumeration output.
 
-Run `beatrix arsenal` for the full table. 32 registered modules across 5 kill chain phases:
+The log buffer is unlimited at `-vvv`, capped at 500 lines at `-vv`, and 200 at `-v` (default is 50).
 
-**Phase 1 — Reconnaissance:**
+---
+
+## The Kill Chain
+
+Every `hunt` runs a 7-phase methodology. Phases run sequentially; the output of each phase feeds into the next.
+
+**Phase 1 — CDN Bypass**
+Detects Cloudflare, Akamai, Fastly, CloudFront, Sucuri, Incapsula, PerimeterX, DataDome, and Kasada via IP range and header fingerprinting. Discovers origin IPs through DNS history, crt.sh SSL certificates, MX records, subdomain correlation, misconfiguration checks, and WHOIS. When an origin IP is confirmed, all subsequent network scans target it directly rather than the CDN edge. Optional API keys (SecurityTrails, Censys, Shodan) extend this via environment variables.
+
+**Phase 2 — Reconnaissance**
+Subdomain enumeration via `subfinder` and `amass`, crawling via `katana`, `gospider`, `hakrawler`, and `gau`, full 65535-port TCP scan via `nmap -sS -p-` against origin IP when available, service fingerprinting, NSE vuln/discovery/auth scripts, UDP top-50 scan, firewall fingerprinting and bypass testing via `scapy`, SSH deep audit via `paramiko`, JS bundle analysis, endpoint probing, tech fingerprinting via `whatweb` and `webanalyze`, nuclei recon templates, and nuclei network protocol checks.
+
+**Phase 3 — Weaponization**
+Subdomain takeover (30+ cloud services), error disclosure, cache poisoning, prototype pollution.
+
+**Phase 4 — Delivery**
+CORS, open redirects, OAuth redirect URI manipulation, HTTP request smuggling (CL.TE / TE.CL / TE.TE), WebSocket testing.
+
+**Phase 5 — Exploitation**
+Injection (SQLi, XSS, CMDi) with `response_analyzer` behavioral detection and WAF bypass fallback (11 WAF profiles, 3-strategy retry with adaptive learning), SSRF, IDOR, broken access control, auth bypass, SSTI, XXE, deserialization, GraphQL, mass assignment, business logic, ReDoS, payment flow manipulation, nuclei exploit scan (CVEs, workflows, interactsh OOB, WAF bypass via realistic UA and CDN-aware rate limiting), and nuclei headless (DOM XSS, prototype pollution). SmartFuzzer runs ffuf-verified fuzzing with profile-targeted WAF encoding. Confirmed findings are escalated to `sqlmap`, `dalfox`, `commix`, and `jwt_tool`.
+
+**Phase 6 — Installation**
+File upload extension bypass, polyglot uploads, path traversal.
+
+**Phase 7 — C2**
+OOB callback correlation via the built-in `PoCServer` (pure asyncio, auto-binds a free port) or external `interactsh`. Blind SSRF, XXE, and RCE confirmation from callbacks registered during Phase 5. `LocalPoCClient` provides offset-based dedup polling.
+
+**Phase 8 — Objectives**
+VRT classification (Bugcrowd VRT + CVSS 3.1), exploit chain generation via `PoCChainEngine` (correlates two or more related findings), deduplication, and impact assessment.
+
+---
+
+## Scanner Modules
+
+Run `beatrix arsenal` for the full table. 32 modules across 5 kill chain phases.
+
+**Phase 1 — Reconnaissance**
 
 | Module | What It Does |
 |--------|-------------|
-| `origin_ip` | CDN detection (Cloudflare/Akamai/Fastly/CloudFront/Sucuri/Incapsula/PerimeterX/DataDome/Kasada) + origin IP discovery via DNS history, SSL certs, MX records, subdomain correlation, misconfig checks |
+| `origin_ip` | CDN detection and origin IP discovery via DNS history, SSL certs, MX records, subdomain correlation, and misconfiguration checks |
 | `crawl` | Depth-limited spider with soft-404 detection, form/param extraction |
-| `endpoint_prober` | Probes 200+ common API/admin/debug paths |
-| `js_analysis` | Extracts API routes, secrets, source maps from JS bundles |
-| `headers` | CSP, HSTS, X-Frame-Options, security header analysis |
+| `endpoint_prober` | Probes 200+ common API, admin, and debug paths |
+| `js_analysis` | Extracts API routes, secrets, and source maps from JS bundles |
+| `headers` | CSP, HSTS, X-Frame-Options, and security header analysis |
 | `github_recon` | GitHub org secret scanning, git history analysis |
-| `nmap_nse` | Full TCP 65535-port scan, service ID, NSE vuln/discovery/auth scripts, UDP top-50 |
-| `ssh_auditor` | SSH server fingerprint, weak KEX/cipher/MAC, default credential brute-force |
+| `nmap_nse` | Full TCP 65535-port scan, service identification, NSE vuln/discovery/auth scripts, UDP top-50 |
+| `ssh_auditor` | SSH fingerprint, weak KEX/cipher/MAC detection, default credential brute-force |
 | `packet_crafter` | Firewall fingerprint, source-port bypass, IP fragment bypass, TTL mapping |
 
-**Phase 2 — Weaponization:**
+**Phase 2 — Weaponization**
 
 | Module | What It Does |
 |--------|-------------|
 | `takeover` | Dangling CNAME detection for 30+ cloud services |
 | `error_disclosure` | Stack traces, SQL errors, framework debug info leaks |
 | `cache_poisoning` | Unkeyed header injection, fat GET, parameter cloaking |
-| `prototype_pollution` | Server-side + client-side JS prototype pollution |
+| `prototype_pollution` | Server-side and client-side JS prototype pollution |
 
-**Phase 3 — Delivery:**
+**Phase 3 — Delivery**
 
 | Module | What It Does |
 |--------|-------------|
@@ -232,16 +234,16 @@ Run `beatrix arsenal` for the full table. 32 registered modules across 5 kill ch
 | `http_smuggling` | CL.TE / TE.CL / TE.TE desync |
 | `websocket` | WebSocket origin, CSWSH, message injection |
 
-**Phase 4 — Exploitation:**
+**Phase 4 — Exploitation**
 
 | Module | What It Does |
 |--------|-------------|
-| `injection` | SQLi, XSS, CMDi, LFI, SSTI — 57K+ payloads via SecLists + PayloadsAllTheThings, response_analyzer behavioral detection, profile-aware WAF bypass (11 profiles) |
-| `ssrf` | 44+ payloads, cloud metadata, internal service access |
-| `idor` | Sequential/UUID/negative ID manipulation |
+| `injection` | SQLi, XSS, CMDi, LFI, SSTI — 57K+ payloads, behavioral detection, 11-profile WAF bypass |
+| `ssrf` | 44+ payloads, cloud metadata endpoints, internal service access |
+| `idor` | Sequential, UUID, and negative ID manipulation |
 | `bac` | Method override, force browsing, privilege escalation |
 | `auth` | JWT attacks, 2FA bypass, session management |
-| `ssti` | Server-side template injection (Jinja2, Twig, etc.) |
+| `ssti` | Server-side template injection (Jinja2, Twig, and others) |
 | `xxe` | XML external entity injection |
 | `deserialization` | Insecure deserialization (Java, PHP, Python, .NET) |
 | `graphql` | Introspection, batching, injection |
@@ -249,62 +251,72 @@ Run `beatrix arsenal` for the full table. 32 registered modules across 5 kill ch
 | `business_logic` | Race conditions, boundary testing |
 | `redos` | Regular expression denial of service |
 | `payment` | Checkout flow manipulation, price tampering |
-| `nuclei` | Intelligent multi-phase scanner — recon, exploit, network, headless. 18,000+ templates with WAF bypass (realistic UA, CDN-aware rate limiting, origin IP rewrite). All scanners: 11-profile WAF bypass with 3-strategy retry and adaptive learning |
+| `nuclei` | Multi-phase scanner — recon, exploit, network, headless. 18,000+ templates with WAF bypass |
 
-**Phase 5 — Installation:**
+**Phase 5 — Installation**
 
 | Module | What It Does |
 |--------|-------------|
 | `file_upload` | Extension bypass, polyglot uploads, path traversal |
 
-### External Tool Integrations (13 Runners)
+---
 
-Beatrix wraps 13 external security tools via async subprocess runners with timeouts and structured output parsing. These are used by kill chain phases to augment the internal scanners:
+## External Tool Integrations
 
-| Tool | Used In | Purpose |
-|------|---------|---------|
+Beatrix wraps 13 external tools via async subprocess runners. All runners support real-time output streaming when `-vvv` is active.
+
+| Tool | Phase | Purpose |
+|------|-------|---------|
 | `subfinder` | Recon | Passive subdomain enumeration |
-| `amass` | Recon | Active/passive subdomain enum |
-| `nmap` | Recon | Full TCP/UDP port scanning, service detection, NSE scripts |
+| `amass` | Recon | Active/passive subdomain enumeration |
+| `nmap` | Recon | Full TCP/UDP port scanning, NSE scripts |
 | `katana` | Recon | Deep crawling, JS rendering |
-| `gospider` | Recon | Fast crawling, form/JS extraction |
+| `gospider` | Recon | Fast crawling, form and JS extraction |
 | `hakrawler` | Recon | URL discovery |
 | `gau` | Recon | Historical URL harvesting |
 | `whatweb` | Recon | Technology fingerprinting |
 | `webanalyze` | Recon | Wappalyzer-based tech detection |
-| `dirsearch` | Recon | Directory brute-forcing (adaptive extensions) |
-| `sqlmap` | Exploitation | Deep SQLi exploitation, DB takeover |
+| `dirsearch` | Recon | Directory brute-forcing |
+| `sqlmap` | Exploitation | Deep SQLi exploitation, DB enumeration |
 | `dalfox` | Exploitation | XSS validation, WAF bypass |
 | `commix` | Exploitation | OS command injection exploitation |
-| `jwt_tool` | Exploitation | JWT vulnerability analysis, role escalation |
-| `metasploit` | PoC Chain | Exploit search, module suggestions |
+| `jwt_tool` | Exploitation | JWT vulnerability analysis, claim tampering |
+| `metasploit` | PoC Chain | Exploit search, resource file generation |
 
-Use a specific module with `strike`:
+---
+
+## IP Address Targets
+
+Beatrix fully supports raw IPv4 and IPv6 targets. Domain-only operations are skipped automatically:
+
+- **Skipped:** Subdomain enumeration, origin IP discovery, GitHub recon, subdomain takeover checks
+- **Active:** All HTTP-based scanners (injection, CORS, SSRF, IDOR, XXE, and others), port scanning, service detection, firewall testing
 
 ```bash
-beatrix strike https://api.example.com -m cors
-beatrix strike https://example.com/login -m injection
-```
+beatrix hunt 192.168.1.1
+beatrix hunt 10.0.0.1 --preset full
+beatrix strike http://192.168.1.1:8080/api -m injection
 
-Or combine modules during a `hunt`:
-
-```bash
-beatrix hunt example.com -m cors -m idor -m ssrf
+# IPs work in target files too
+echo "192.168.1.1
+10.0.0.2
+https://172.16.0.1:443" > targets.txt
+beatrix hunt -f targets.txt
 ```
 
 ---
 
 ## Network Testing (Full Preset)
 
-The `--preset full` hunt runs a 4-phase adaptive network pipeline in the Reconnaissance phase. Each phase's output drives the next.
+`--preset full` runs a 4-phase adaptive network pipeline inside the Reconnaissance phase.
 
-### Phase 0: CDN BYPASS (origin_ip_discovery)
+### CDN Bypass (origin_ip_discovery)
 
-Runs automatically before port scanning. Detects CDN/WAF and discovers origin IPs.
+Runs before port scanning. Detects CDN/WAF and discovers origin IPs.
 
-| Technique | Source | API Key? | Confidence |
-|-----------|--------|----------|------------|
-| DNS History | ViewDNS, DNSDumpster | No | 0.5–0.6 |
+| Technique | Source | API Key | Confidence |
+|-----------|--------|---------|------------|
+| DNS History | ViewDNS, DNSDumpster | No | 0.5-0.6 |
 | SSL Certificate Search | crt.sh | No | 0.7 |
 | MX Record Analysis | dig MX records | No | 0.8 |
 | Subdomain Correlation | 40+ bypass subdomains | No | 0.7 |
@@ -314,22 +326,22 @@ Runs automatically before port scanning. Detects CDN/WAF and discovers origin IP
 | Censys Certificate Search | Censys API | `CENSYS_API_ID` + `CENSYS_API_SECRET` | 0.8 |
 | Shodan Host Search | Shodan API | `SHODAN_API_KEY` | 0.75 |
 
-Discovered origin IPs are validated (HTTP/HTTPS with Host header) and the highest-confidence validated IP replaces the CDN edge IP for all subsequent network scans.
+Discovered IPs are validated (HTTP/HTTPS with Host header). The highest-confidence validated IP replaces the CDN edge for all subsequent network scans.
 
-### Phase 1: DISCOVER (nmap)
+### Phase 1 — Discovery (nmap)
 
-| Step | What | Timeout |
-|------|------|---------|
+| Step | Command | Timeout |
+|------|---------|---------|
 | 1a | `nmap -sS -p- --min-rate 3000 -T4` — all 65535 TCP ports | 600s |
-| 1b | Service/version fingerprint on open ports only | 300s |
-| 1c | NSE `vuln and safe` scripts — CVEs, misconfigs | 600s |
-| 1d | NSE `discovery and safe` scripts — http-enum, ssl-cert, banners | 600s |
-| 1e | NSE `auth and safe` scripts — default creds, anonymous access | 600s |
-| 1f | UDP top 50 — DNS, SNMP, NTP, SSDP | 120s |
+| 1b | Service/version fingerprint on open ports | 300s |
+| 1c | NSE `vuln and safe` — CVEs, misconfigs | 600s |
+| 1d | NSE `discovery and safe` — http-enum, ssl-cert, banners | 600s |
+| 1e | NSE `auth and safe` — default creds, anonymous access | 600s |
+| 1f | UDP top-50 — DNS, SNMP, NTP, SSDP | 120s |
 
-### Phase 2: ANALYZE (scapy)
+### Phase 2 — Firewall Analysis (scapy)
 
-Only runs when Phase 1 finds filtered ports.
+Runs only when Phase 1 finds filtered ports.
 
 | Step | What |
 |------|------|
@@ -338,253 +350,218 @@ Only runs when Phase 1 finds filtered ports.
 | 2c | IP fragmentation bypass — split TCP headers |
 | 2d | TTL mapping — locate firewall hop position |
 
-Each successful bypass generates a HIGH/CRITICAL finding.
+Each successful bypass generates a HIGH or CRITICAL finding.
 
-### Phase 3: AUDIT (paramiko + NSE)
-
-Service-specific deep audit based on Phase 1 discovery.
+### Phase 3 — Service Audit (paramiko / NSE)
 
 | Service | Tool | Checks |
 |---------|------|--------|
-| SSH | paramiko | Banner, KEX/cipher/MAC weakness, key strength, 20+ default creds |
+| SSH | paramiko | Banner, KEX/cipher/MAC weakness, key strength, 20+ default credentials |
 | FTP | NSE | Anonymous access, bounce attack, vsftpd backdoor |
-| SMTP | NSE | Open relay, user enum, NTLM info |
-| MySQL/Postgres | NSE | Empty password, brute, version |
-| Redis/MongoDB | NSE | Unauthenticated access (CRITICAL) |
+| SMTP | NSE | Open relay, user enumeration, NTLM info |
+| MySQL/Postgres | NSE | Empty password, brute-force, version |
+| Redis/MongoDB | NSE | Unauthenticated access |
 | TLS | NSE | ssl-enum-ciphers, Heartbleed, POODLE, CCS injection |
 
 ### Context Flow
 
-Network results are stored in `context["network"]` and consumed by downstream phases:
+Network results propagate to downstream phases:
 
-- **Phase 0 → Phase 1** — Origin IP replaces CDN edge for all nmap scans
-- **Delivery (Phase 3)** — HTTP smuggling tested on ALL discovered HTTP ports + origin IP directly
-- **Exploitation (Phase 4)** — Injection/SSRF/XSS on all HTTP ports + origin IP (CDN bypass)
-- **C2 (Phase 6)** — Firewall profile informs exfiltration channel assessment
+- CDN Bypass → Discovery: origin IP replaces CDN edge for all nmap scans
+- Delivery: HTTP smuggling tested on all discovered HTTP ports plus origin IP directly
+- Exploitation: injection/SSRF/XSS on all HTTP ports plus origin IP
+- C2: firewall profile informs exfiltration channel assessment
 
-### CDN Bypass API Keys (Optional)
-
-Set these environment variables to enable additional origin IP discovery techniques:
+### API Keys (Optional)
 
 ```bash
-export SECURITYTRAILS_API_KEY=your_key_here    # SecurityTrails DNS history
-export CENSYS_API_ID=your_id_here              # Censys certificate search
-export CENSYS_API_SECRET=your_secret_here      # Censys API secret
-export SHODAN_API_KEY=your_key_here            # Shodan host search
+export SECURITYTRAILS_API_KEY=your_key
+export CENSYS_API_ID=your_id
+export CENSYS_API_SECRET=your_secret
+export SHODAN_API_KEY=your_key
 ```
 
-Without API keys, Beatrix uses 6 free techniques that work for most targets.
+Without API keys, the six free techniques cover most targets.
 
 ---
 
 ## Usage Examples
 
-### Basic Hunting
+### Basic Scanning
 
 ```bash
-# Quick surface scan
 beatrix hunt example.com --preset quick
-
-# Scan an IP address (skips domain-only operations like subdomain enum)
-beatrix hunt 192.168.1.1
-
-# Hunt an IP with a specific preset
-beatrix hunt 10.0.0.1 --preset full
-
-# Full assault
 beatrix hunt example.com --preset full
-
-# AI-assisted
 beatrix hunt example.com --preset full --ai
 
-# Hunt all targets from a .txt file (one URL per line)
+# File-based (one URL/IP per line, # for comments)
 beatrix hunt -f targets.txt
-
-# File-based hunt with full preset and reports
 beatrix hunt -f targets.txt --preset full -o ./reports
+
+# With verbosity
+beatrix hunt example.com --preset full -vvv
+beatrix hunt example.com --preset full -vvv -o results.json > scan.log
 ```
 
 ### Targeted Strikes
 
 ```bash
-# Test a single endpoint for CORS
 beatrix strike https://api.example.com/v1/users -m cors
-
-# Check for SSRF
 beatrix strike https://example.com/fetch?url=test -m ssrf
-
-# Analyze JavaScript bundles
 beatrix strike https://app.example.com -m js_analysis
+beatrix strike https://api.example.com -m injection -vvv
 ```
 
 ### Reconnaissance
 
 ```bash
-# Basic recon
 beatrix recon example.com
-
-# Deep scan (probes all discovered subdomains)
 beatrix recon example.com --deep
-
-# Save results as JSON
 beatrix recon example.com --deep -j -o recon.json
 ```
 
 ### Batch Scanning
 
 ```bash
-# Create a targets file (one URL per line, # for comments)
-echo "https://api.target1.com
-https://api.target2.com
-https://api.target3.com" > targets.txt
-
-# Hunt all targets through the full kill chain
-beatrix hunt -f targets.txt
-
-# Hunt with specific preset and output
-beatrix hunt -f targets.txt --preset full --ai -o ./reports
-
-# Single-module batch scan (CORS only)
+# Single module across many targets
 beatrix batch targets.txt -m cors -o ./reports
+
+# Full kill chain across a file of targets
+beatrix hunt -f targets.txt --preset full --ai -o ./reports
 ```
 
 ### GHOST — Autonomous AI Pentester
 
 ```bash
-# Basic investigation
 beatrix ghost https://api.example.com/users?id=1
-
-# With a specific objective
 beatrix ghost https://api.example.com -X POST -d '{"user":"admin"}' -o "Test for SQL injection"
-
-# With auth
 beatrix ghost https://example.com -H "Authorization: Bearer TOKEN" --max-turns 50
 ```
 
-### Authenticated Scanning
+---
 
-Beatrix supports authenticated scanning through config files, CLI flags, environment variables, and **Burp Suite-style auto-login**. Auth flows automatically to all scanners — nuclei gets `-H` flags, IDOR gets user sessions, the crawler gets cookies.
+## Authenticated Scanning
 
-#### Auto-Login (Burp Suite-style)
+Beatrix supports authenticated scanning via config file, CLI flags, environment variables, auto-login, manual browser login, and HAR file import. Credentials flow automatically to all scanners — nuclei receives `-H` flags, the IDOR scanner gets user sessions, and the crawler gets cookies.
 
-Store your username/email and password and Beatrix will automatically log in before scanning — just like Burp Suite's login macro. It probes common API and form login endpoints, tries multiple field-name combinations, and captures session tokens/cookies on success.
+### Auto-Login
+
+Beatrix can authenticate before scanning by probing login endpoints, similar to a Burp Suite login macro.
 
 ```bash
-# Interactive login wizard (saves to ~/.beatrix/auth.yaml)
+# Interactive wizard (saves to ~/.beatrix/auth.yaml)
 beatrix auth login example.com
 
-# Or pass credentials via CLI flags
-beatrix hunt target.com --login-user user@example.com --login-pass 'your-password-here'
-beatrix hunt target.com --login-user user@example.com --login-pass 'your-password-here' --login-url https://target.com/api/auth/login
+# CLI flags
+beatrix hunt target.com --login-user user@example.com --login-pass 'password'
+beatrix hunt target.com --login-user user@example.com --login-pass 'password' \
+    --login-url https://target.com/api/auth/login
 
-# Or via environment variables
+# Environment variables
 export BEATRIX_LOGIN_USER="user@example.com"
-export BEATRIX_LOGIN_PASS="your-password-here"
-export BEATRIX_LOGIN_URL="https://target.com/api/auth/login"  # optional
+export BEATRIX_LOGIN_PASS="password"
+export BEATRIX_LOGIN_URL="https://target.com/api/auth/login"
 beatrix hunt target.com
 ```
 
-The `auth login` wizard prompts for target, username/email, password (masked input), and optional login URL. Credentials are saved to `~/.beatrix/auth.yaml` and auto-loaded on subsequent scans.
+How auto-login works:
 
-**How it works:**
 1. Collects cookies from the target's home page (CSRF tokens, etc.)
-2. Probes 24 common API login endpoints with JSON payloads (`/api/auth/login`, `/api/v1/session`, `/oauth/token`, etc.)
-3. Tries 12 traditional form login endpoints (`/login`, `/signin`, `/wp-login.php`, etc.)
-4. Uses 10 field-name combinations per endpoint (`email`/`password`, `username`/`passwd`, `login`/`pass`, etc.)
-5. Skips 404s quickly, stops on 401/403 (endpoint found, credentials wrong)
-6. **Detects OTP/2FA challenges** — if the server responds with a verification code requirement (email OTP, SMS code, TOTP), Beatrix prompts you to enter the code interactively
-7. On success, captured session cookies and auth tokens flow to all scanners
-8. **Session is saved** to `~/.beatrix/sessions/` and reused for 24 hours (skip re-auth on repeat scans)
+2. Probes 24 common API login endpoints with JSON payloads (`/api/auth/login`, `/api/v1/session`, `/oauth/token`, and others)
+3. Tries 12 traditional form login endpoints (`/login`, `/signin`, `/wp-login.php`, and others)
+4. Uses 10 field-name combinations per endpoint (`email`/`password`, `username`/`passwd`, and others)
+5. Skips 404s quickly; stops on 401/403 (endpoint found, credentials wrong)
+6. Detects OTP/2FA challenges and prompts for the code interactively
+7. Captured session cookies and tokens flow to all scanners
+8. Session is saved to `~/.beatrix/sessions/` and reused for 24 hours
 
-#### OTP / 2FA Handling
+### OTP / 2FA Handling
 
-Many sites require OTP verification on every login. Beatrix detects OTP challenges automatically by scanning JSON responses for 2FA keywords (`requires_2fa`, `verification_required`, `otp`, etc.) and prompts you to enter the code sent to your email/phone.
+When Beatrix detects a 2FA response (by scanning JSON for `requires_2fa`, `verification_required`, `otp`, and similar fields), it prompts for the code interactively.
 
-If auto-login can't complete (WAF blocks, CAPTCHA, complex 2FA), use the **manual browser login**:
+For CAPTCHA, WAF blocks, or complex 2FA flows, use manual browser login or HAR import:
 
 ```bash
-# Open a browser, log in manually, Beatrix captures your session
+# Open a browser, log in manually — Beatrix captures the complete session
+# (including HttpOnly cookies and localStorage tokens)
 beatrix auth browser example.com
 
-# In headless environments (e.g., codespaces), paste cookies from DevTools instead
-beatrix auth browser example.com  # falls back to cookie-paste prompt
-
-# Or pass cookies directly from your browser's DevTools
+# Or pass cookies directly from DevTools
 beatrix hunt example.com --cookie "session=abc123" --cookie "XSRF-TOKEN=xyz"
 ```
 
-#### Session Persistence
+> **Note:** In environments without a display (e.g., GitHub Codespaces), `auth browser` falls back to a cookie-paste prompt. To capture all cookies including HttpOnly ones, open the target in your local browser, go to **DevTools → Network**, click any authenticated request, and copy the full `Cookie:` request header value. Avoid the Application → Storage → Cookies panel, which misses HttpOnly cookies.
 
-Once authenticated (via auto-login, manual browser, or OTP flow), sessions are saved to `~/.beatrix/sessions/<domain>.json` and automatically reused for 24 hours.
+### HAR Import
+
+The easiest way to hand Beatrix a fully authenticated session is to export a HAR file from your browser's DevTools and import it directly. This captures all cookies (including HttpOnly), Authorization headers, and API keys exactly as they appeared in real requests.
 
 ```bash
-# List all saved sessions
-beatrix auth sessions
+# 1. Log in with your browser normally
+# 2. DevTools → Network → right-click any request → "Save all as HAR with content"
+# 3. Import into Beatrix
+beatrix auth import example.com session.har
 
-# Clear a specific session
-beatrix auth sessions --clear example.com
+# Also accepts a plain text cookie string
+beatrix auth import example.com cookies.txt
 
-# Clear all sessions
-beatrix auth sessions --clear-all
-
-# Force fresh login (ignore saved session)
-beatrix hunt example.com --fresh-login
-
-# Use manual browser login for this hunt
-beatrix hunt example.com --manual-login
+# Verify the imported session
+beatrix auth show -t example.com
 ```
 
-#### Static Credentials (Manual)
+Beatrix scores every entry in the HAR by request URL (preferring authenticated API calls over static assets), extracts the best `Cookie` header, `Authorization: Bearer` token, and any `X-Api-Key` / `X-Auth-Token` headers, then saves the result as a normal session file that all scanners pick up automatically.
+
+### Session Persistence
+
+Authenticated sessions are saved to `~/.beatrix/sessions/<domain>.json` and reused for 24 hours. If the session contains a JWT, Beatrix additionally checks the token's `exp` claim on every load — a token expiring within 5 minutes is discarded automatically so stale sessions never reach scanners.
 
 ```bash
-# Generate a sample config file
-beatrix auth init
+beatrix auth sessions                         # list all saved sessions
+beatrix auth sessions --clear example.com     # clear one
+beatrix auth sessions --clear-all             # clear all
+beatrix hunt example.com --fresh-login        # force re-authentication
+beatrix hunt example.com --manual-login       # browser login for this scan
+```
 
-# Edit ~/.beatrix/auth.yaml with your credentials, then scan — auth is auto-loaded
-beatrix hunt target.com
+### Static Credentials
 
-# Or use CLI flags directly
+```bash
+beatrix auth init                             # generate sample config
 beatrix hunt target.com --token "Bearer eyJ..."
-beatrix hunt target.com --cookie "session=abc123" --cookie "csrf=xyz"
+beatrix hunt target.com --cookie "session=abc123"
 beatrix hunt target.com --header "X-API-Key: key123"
 beatrix hunt target.com --auth-user admin --auth-pass password
-
-# View current auth state
 beatrix auth show
 beatrix auth show -t example.com
-
-# Edit auth config in your default editor
-beatrix auth config
+beatrix auth config                           # edit in default editor
 ```
 
-Auth config supports per-target credentials and IDOR dual-session testing (see `~/.beatrix/auth.yaml`).
+Auth config supports per-target credentials and IDOR dual-session testing. See `~/.beatrix/auth.yaml`.
 
-### GitHub Secret Scanning
+---
+
+## GitHub Secret Scanning
 
 ```bash
-# Full org scan
 beatrix github-recon acme-corp
-
-# Quick scan (skip git history)
-beatrix github-recon acme-corp --quick
-
-# Specific repo with report
+beatrix github-recon acme-corp --quick                              # skip git history
 beatrix github-recon acme-corp --repo acme-corp/api-server -o report.md
 ```
 
-### Validation
+---
+
+## Validation
 
 ```bash
-# Validate findings before submission
 beatrix validate beatrix_report.json
-
-# Validate with verbose output
 beatrix validate scan_results.json -v
 ```
 
 Accepts both envelope format (`{"findings": [...], "metadata": {...}}`) and bare lists (`[...]`).
 
-### JSON Output Format
+---
+
+## Output Format
 
 All `-o` / `--output` JSON exports use a standardized envelope:
 
@@ -614,21 +591,39 @@ All `-o` / `--output` JSON exports use a standardized envelope:
 
 ---
 
+## Scan Output Directory
+
+Every `hunt` creates an organized output directory in the current working directory, named after the target and timestamped:
+
+```
+example.com-scan-09-Mar-2026_17-53-48/
+├── scan_info.txt               # target, start time, duration
+├── recon/                      # katana, amass, nmap, whatweb raw output
+├── weaponization/              # takeover, error disclosure results
+├── delivery/                   # CORS, redirect, smuggling results
+├── exploitation/               # sqlmap, dalfox, injection results
+├── installation/               # file upload results
+├── c2/                         # OOB callback results
+├── actions/                    # VRT classification results
+└── findings/                   # aggregated findings JSON and summary
+```
+
+All external tool runners capture raw stdout automatically. Scanner results are written as JSON after each module completes. No extra flags are needed.
+
+---
+
 ## Configuration
 
 Config file: `~/.beatrix/config.yaml`
 
 ```bash
-# Show current config
 beatrix config --show
-
-# Set values
 beatrix config --set scanning.rate_limit 50
 beatrix config --set ai.enabled true
 beatrix config --set output.dir ./my_results
 ```
 
-### Available Config Keys
+### Config Keys
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -658,22 +653,13 @@ beatrix config --set output.dir ./my_results
 ## Getting Help
 
 ```bash
-# Open the full interactive HTML manual (recommended)
-beatrix manual
-
-# Quick reference table
-beatrix
-
-# Detailed help for any command
+beatrix manual          # full interactive HTML manual
+beatrix                 # quick reference
 beatrix help hunt
 beatrix help strike
 beatrix help ghost
 beatrix help bounty-hunt
-
-# Full module reference
-beatrix arsenal
-
-# List available stuff
+beatrix arsenal         # full module reference
 beatrix list --modules
 beatrix list --presets
 ```
@@ -684,69 +670,46 @@ beatrix list --presets
 
 ```
 beatrix/
-├── cli/main.py              # CLI entry point — 26 commands via Click + Rich
+├── cli/main.py               # CLI entry point — 26 commands via Click + Rich
 ├── core/
-│   ├── engine.py            # BeatrixEngine — orchestrates everything, 32 modules
-│   ├── kill_chain.py        # 7-phase kill chain executor + 3-phase network pipeline
-│   ├── nmap_scanner.py      # Full TCP/UDP scanning, NSE vuln/discovery/auth scripts
-│   ├── packet_crafter.py    # Scapy firewall fingerprint, source-port/fragment bypass, TTL map
-│   ├── ssh_auditor.py       # SSH fingerprint, weak crypto, default credential brute-force
-│   ├── external_tools.py    # 13 async subprocess tool runners
-│   ├── types.py             # Finding, Severity, Confidence, ScanContext
-│   ├── seclists_manager.py  # Dynamic wordlist engine (SecLists + PayloadsAllTheThings)
-│   ├── oob_detector.py      # OOB callback manager (LocalPoCClient + interact.sh)
-│   ├── poc_server.py        # Built-in PoC validation server (890 LOC, pure asyncio)
+│   ├── engine.py             # BeatrixEngine — orchestrates all modules
+│   ├── kill_chain.py         # 7-phase kill chain executor + 3-phase network pipeline
+│   ├── nmap_scanner.py       # Full TCP/UDP scanning, NSE scripts
+│   ├── packet_crafter.py     # Scapy firewall fingerprint, source-port/fragment bypass
+│   ├── ssh_auditor.py        # SSH fingerprint, weak crypto, default credential brute-force
+│   ├── external_tools.py     # 13 async subprocess tool runners with streaming support
+│   ├── types.py              # Finding, Severity, Confidence, ScanContext
+│   ├── seclists_manager.py   # Dynamic wordlist engine (SecLists + PayloadsAllTheThings)
+│   ├── oob_detector.py       # OOB callback manager (LocalPoCClient + interactsh)
+│   ├── poc_server.py         # Built-in PoC validation server (pure asyncio)
 │   ├── correlation_engine.py # MITRE ATT&CK correlation
-│   ├── findings_db.py       # SQLite findings storage (WAL mode)
+│   ├── findings_db.py        # SQLite findings storage (WAL mode)
 │   ├── issue_consolidator.py # Finding deduplication
-│   ├── poc_chain_engine.py  # PoC generation + Metasploit integration
-│   └── scan_output.py       # Per-scan organized output directory
+│   ├── poc_chain_engine.py   # PoC generation + Metasploit integration
+│   └── scan_output.py        # Per-scan organized output directory
 ├── scanners/
-│   ├── base.py              # BaseScanner ABC — rate limiting, httpx client
-│   ├── crawler.py           # Target spider — foundation for all scanning
-│   ├── origin_ip_discovery.py # CDN bypass — Cloudflare/Akamai/Fastly origin IP discovery (1,039 LOC)
-│   ├── injection.py         # SQLi, XSS, CMDi, LFI, SSTI (57K+ dynamic payloads, response_analyzer + WAF bypass)
-│   ├── ssrf.py              # 44-payload SSRF scanner
-│   ├── cors.py              # 6-technique CORS bypass scanner
-│   ├── auth.py              # JWT, OAuth, 2FA, session attacks
-│   ├── idor.py              # IDOR + BAC scanners
-│   ├── nuclei.py            # Nuclei v3 — multi-phase, authenticated, WAF bypass (realistic UA, CDN-aware rate limiting, origin IP rewrite)
-│   └── ...                  # 30 scanner modules total
-├── validators/              # ImpactValidator + ReadinessGate
-├── reporters/               # Markdown, JSON, HTML chain reports
-├── recon/                   # ReconRunner — subfinder/amass/nmap integration
-├── ai/                      # GHOST agent, Haiku integration
-├── integrations/            # External service clients
-└── utils/                   # WAF bypass, VRT classifier, helpers, response_analyzer
+│   ├── base.py               # BaseScanner — rate limiting, httpx client, logging
+│   ├── crawler.py            # Target spider — foundation for all scanning
+│   ├── origin_ip_discovery.py # CDN bypass + origin IP discovery
+│   ├── injection.py          # SQLi, XSS, CMDi, LFI, SSTI (57K+ payloads, WAF bypass)
+│   ├── ssrf.py               # 44-payload SSRF scanner
+│   ├── cors.py               # 6-technique CORS bypass scanner
+│   ├── auth.py               # JWT, OAuth, 2FA, session attacks
+│   ├── idor.py               # IDOR and BAC scanners
+│   ├── nuclei.py             # Nuclei v3 — multi-phase, authenticated, WAF bypass
+│   └── ...                   # 30 scanner modules total
+├── validators/               # ImpactValidator, ReadinessGate
+├── reporters/                # Markdown, JSON, HTML chain reports
+├── recon/                    # ReconRunner — subfinder/amass/nmap integration
+├── ai/                       # GHOST agent, Haiku integration
+├── integrations/             # External service clients
+└── utils/                    # WAF bypass, VRT classifier, response_analyzer
 ```
 
 ---
 
-## Scan Output
+## Legal
 
-Every `beatrix hunt` automatically creates an organized output directory in the current working directory, named after the target and timestamped:
-
-```
-example.com-scan-09-Mar-2026_17-53-48/
-├── scan_info.txt               # Scan metadata (target, times, duration)
-├── recon/                      # Phase 1: katana, amass, nmap, whatweb output
-├── weaponization/              # Phase 2: takeover, error disclosure results
-├── delivery/                   # Phase 3: CORS, redirect, smuggling results
-├── exploitation/               # Phase 4: sqlmap, dalfox, injection results
-├── installation/               # Phase 5: file upload results
-├── c2/                         # Phase 6: OOB callback results
-├── actions/                    # Phase 7: VRT classification results
-└── findings/                   # Final aggregated findings JSON + summary
-```
-
-All 13 external tool runners automatically capture raw stdout, and scanner results are saved as JSON after each module completes. No extra flags needed — output is always saved.
-
----
-
-## Legal Disclaimer
-
-This tool is designed for **authorized security testing only**. Only use Beatrix against targets you have explicit permission to test. Unauthorized access to computer systems is illegal.
-
-The operators of this tool are responsible for ensuring all applicable laws and regulations are followed.
+This tool is for authorized security testing only. Only use Beatrix against targets you have explicit written permission to test. Unauthorized access to computer systems is illegal in most jurisdictions.
 
 ---

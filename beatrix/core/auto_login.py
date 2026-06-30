@@ -2033,9 +2033,19 @@ def _session_file(domain: str) -> _Path:
     return SESSIONS_DIR / f"{safe_name}.json"
 
 
-def save_session(domain: str, login_result: LoginResult) -> _Path:
+def save_session(
+    domain: str,
+    login_result: LoginResult,
+    playwright_state: Optional[Dict] = None,
+) -> _Path:
     """
     Save a successful login session to disk for reuse.
+
+    Args:
+        domain: Target domain
+        login_result: Captured login result (cookies, headers, token)
+        playwright_state: Optional Playwright storage_state() output for full restore.
+                          Includes HttpOnly cookies + localStorage from all origins.
 
     Returns the path where the session was saved.
     """
@@ -2052,6 +2062,8 @@ def save_session(domain: str, login_result: LoginResult) -> _Path:
         "saved_at": time.time(),
         "saved_at_human": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    if playwright_state:
+        session_data["playwright_state"] = playwright_state
 
     path = _session_file(domain)
     path.write_text(_json.dumps(session_data, indent=2))
@@ -2064,6 +2076,7 @@ def load_session(domain: str, max_age_hours: float = 24.0) -> Optional[LoginResu
     Load a previously saved session for a domain.
 
     Returns LoginResult if a valid (non-expired) session exists, None otherwise.
+    Skips the session if any JWT token is within 5 minutes of expiry.
 
     Args:
         domain: Target domain
@@ -2086,12 +2099,38 @@ def load_session(domain: str, max_age_hours: float = 24.0) -> Optional[LoginResu
         path.unlink(missing_ok=True)
         return None
 
+    # JWT expiry check — decode without signature verification to read exp claim.
+    # Protects against loading a short-lived token (e.g. 15-min JWT) that the
+    # 24h wall-clock check would pass but the server would reject.
+    token = data.get("token")
+    if token and isinstance(token, str) and token.count(".") == 2:
+        try:
+            import base64 as _b64
+            payload_b64 = token.split(".")[1]
+            # Base64url padding
+            payload_b64 += "=" * (4 - len(payload_b64) % 4)
+            payload = _json.loads(_b64.urlsafe_b64decode(payload_b64))
+            exp = payload.get("exp")
+            if exp and isinstance(exp, (int, float)):
+                remaining_s = exp - time.time()
+                if remaining_s < 300:  # less than 5 minutes remaining
+                    logger.info(
+                        f"JWT for {domain} expires in {remaining_s:.0f}s — discarding stale session"
+                    )
+                    path.unlink(missing_ok=True)
+                    return None
+                logger.info(
+                    f"JWT for {domain} valid for another {remaining_s/3600:.1f}h"
+                )
+        except Exception:
+            pass  # Not a standard JWT or decode failed — trust wall-clock check
+
     logger.info(f"Loaded saved session for {domain} (age: {age_hours:.1f}h)")
     return LoginResult(
         success=True,
         cookies=data.get("cookies", {}),
         headers=data.get("headers", {}),
-        token=data.get("token"),
+        token=token,
         method_used=data.get("method_used", "saved"),
         login_url=data.get("login_url", ""),
         message=f"Loaded saved session (age: {age_hours:.0f}h). Use --fresh-login to re-authenticate.",
@@ -2194,25 +2233,41 @@ async def browser_interactive_login(target: str) -> LoginResult:
                 await browser.close()
                 return LoginResult(success=False, message="Browser login cancelled.")
 
-            # Capture cookies
-            cookies = await context.cookies()
-            cookie_dict = {c["name"]: c["value"] for c in cookies}
-
-            # Capture localStorage/sessionStorage tokens
+            # Capture complete session via storage_state() — this includes ALL
+            # cookies (HttpOnly included, via CDP) + localStorage + sessionStorage.
+            # Falls back to cookies() if storage_state is unavailable.
             headers: Dict[str, str] = {}
             token = None
+            cookie_dict: Dict[str, str] = {}
+            playwright_state: Optional[Dict] = None
+
             try:
-                from beatrix.core.auto_login import AUTH_TOKEN_KEYS
-                for key in AUTH_TOKEN_KEYS:
-                    val = await page.evaluate(
-                        f"localStorage.getItem('{key}') || sessionStorage.getItem('{key}')"
-                    )
-                    if val and len(val) > 10:
-                        token = val
-                        headers["Authorization"] = f"Bearer {val}"
-                        break
+                state = await context.storage_state()
+                playwright_state = state
+                cookie_dict = {c["name"]: c["value"] for c in state.get("cookies", [])}
+                # Extract auth tokens from localStorage/sessionStorage origins
+                for origin in state.get("origins", []):
+                    for item in origin.get("localStorage", []) + origin.get("sessionStorage", []):
+                        name = item.get("name", "")
+                        val = item.get("value", "")
+                        if name in AUTH_TOKEN_KEYS and val and len(val) > 10 and not token:
+                            token = val
+                            headers["Authorization"] = f"Bearer {val}"
             except Exception:
-                pass
+                # storage_state unavailable — fall back to cookies() + JS eval
+                try:
+                    raw_cookies = await context.cookies()
+                    cookie_dict = {c["name"]: c["value"] for c in raw_cookies}
+                    for key in AUTH_TOKEN_KEYS:
+                        val = await page.evaluate(
+                            f"localStorage.getItem('{key}') || sessionStorage.getItem('{key}')"
+                        )
+                        if val and len(val) > 10:
+                            token = val
+                            headers["Authorization"] = f"Bearer {val}"
+                            break
+                except Exception:
+                    pass
 
             await browser.close()
 
@@ -2224,10 +2279,10 @@ async def browser_interactive_login(target: str) -> LoginResult:
                     token=token,
                     method_used="browser_interactive",
                     message=f"Browser login captured {len(cookie_dict)} cookies"
-                            + (f" + auth token" if token else ""),
+                            + (" + auth token" if token else ""),
                 )
-                # Auto-save the session
-                save_session(domain, result)
+                # Auto-save the session (including Playwright storage state for full restore)
+                save_session(domain, result, playwright_state=playwright_state)
                 return result
 
             return LoginResult(
@@ -2241,24 +2296,32 @@ async def browser_interactive_login(target: str) -> LoginResult:
 
 def _fallback_cookie_import(target: str) -> LoginResult:
     """
-    Fallback for headless environments: prompt user to paste cookies
-    from their browser's DevTools.
+    Fallback for headless environments: prompt user to paste session data
+    captured from their browser's DevTools Network tab.
     """
     if "://" not in target:
         target = f"https://{target}"
     parsed = urlparse(target)
     domain = parsed.netloc
 
-    print(f"\n🔐 Manual Cookie Import for {domain}")
-    print("   Since we can't open a browser here, paste your cookies.")
+    print(f"\n  Manual Session Import — {domain}")
     print()
-    print("   How to get cookies:")
-    print("   1. Log into the site in your browser (complete OTP etc.)")
-    print("   2. Open DevTools → Application → Cookies")
-    print(f"   3. Or run in console: document.cookie")
+    print("  ── Option A: Copy from Network request (recommended) ──────────────────")
+    print("  This captures ALL cookies including HttpOnly session cookies,")
+    print("  which are invisible to document.cookie and the Application tab.")
     print()
-    print("   Paste the cookie string (name=value; name2=value2):")
-    print("   (or 'skip' to continue without auth)")
+    print("  1. Log into the site in your browser (complete OTP/2FA etc.)")
+    print("  2. Open DevTools (F12) → Network tab")
+    print("  3. Click any authenticated request (e.g. /api/me, /dashboard, /profile)")
+    print("  4. In the 'Headers' panel, scroll to 'Request Headers'")
+    print("  5. Copy the entire value of the 'Cookie:' header")
+    print()
+    print("  ── Option B: Application tab (easier, misses HttpOnly cookies) ────────")
+    print("  1. DevTools → Application → Storage → Cookies → select your domain")
+    print("  2. Note each Name and Value, format as: name=value; name2=value2")
+    print()
+    print("  Paste cookie string below (name=value; name2=value2):")
+    print("  (or 'skip' to scan without authentication)")
     print()
 
     import sys

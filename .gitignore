@@ -1,4 +1,4 @@
-# Credentials - never commit
+# ── Credentials — never commit ────────────────────────────────────────────────
 config/hackerone_credentials.csv
 config/*.csv
 config/*.key
@@ -6,7 +6,7 @@ config/*.secret
 auth.yaml
 **/auth.yaml
 
-# Python
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
@@ -15,31 +15,46 @@ dist/
 build/
 .eggs/
 
-# Virtual environments
+# ── Virtual environments ──────────────────────────────────────────────────────
 .venv/
 venv/
 
-# IDE
+# ── IDE ───────────────────────────────────────────────────────────────────────
 .idea/
 .vscode/
 
-# Tests
+# ── Tests ─────────────────────────────────────────────────────────────────────
 tests/
 
-# Scan output directory
+# ── Scan output — directories created by ScanOutputManager in cwd ─────────────
+# Pattern: {target}-scan-{timestamp}/  e.g. airbnb.com-scan-30-Jun-2026_14-17-43/
+*-scan-*/
 test/
 testscan/
 scans/
 **/scans/
 
-# Audit notes
+# ── Operational output files (reports, exports, raw tool output) ──────────────
+findings.db
+findings.json
+# JSON exports at repo root only (preserves docs/ and .devcontainer/ JSON)
+/*.json
+# Text output dumps at repo root
+/*.txt
+# HTML reports at repo root (preserves docs/manual/index.html)
+/*.html
+reports/
+*.log
+
+# ── Audit notes ───────────────────────────────────────────────────────────────
 audit/
 **/audit/
 
-# Notes
+# ── Personal notes / drafts ───────────────────────────────────────────────────
 BURP_INSPIRATION_NOTES.md
 BURP_DEFERRED_TODO.md
 notes for improvement/
 
-# OS
+# ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
+Thumbs.db

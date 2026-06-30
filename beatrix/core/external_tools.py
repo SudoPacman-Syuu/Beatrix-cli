@@ -18,6 +18,7 @@ Tools covered:
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -63,19 +64,27 @@ class ExternalTool:
     def available(self) -> bool:
         return self.path is not None
 
+    @property
+    def _verbose_mode(self) -> bool:
+        """True when -vvv is active (Python logging at DEBUG level)."""
+        return logging.getLogger(f"beatrix.tools.{self.BINARY_NAME}").isEnabledFor(logging.DEBUG)
+
     async def _run(self, cmd: List[str], stdin: Optional[str] = None,
                    output_manager=None, tool_name: str = "",
                    phase: int = 0) -> Optional[str]:
         """Run a command and return stdout, or None on failure/timeout.
 
-        Raw output is automatically saved when an output_manager is available
-        (either passed directly or set on ``self``).
+        When the root logger is at DEBUG level (-vvv), streams each output line
+        in real-time via the tool's own logger (beatrix.tools.<name>).
+        Raw output is automatically saved when an output_manager is available.
         """
         if not self.available:
             return None
-        # Resolve output manager and phase
         _om = output_manager or self.output_manager
         _phase = phase if phase else self.DEFAULT_PHASE
+        _log = logging.getLogger(f"beatrix.tools.{self.BINARY_NAME}")
+        _streaming = _log.isEnabledFor(logging.DEBUG)
+
         try:
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -83,39 +92,72 @@ class ExternalTool:
                 stderr=asyncio.subprocess.PIPE,
                 stdin=asyncio.subprocess.PIPE if stdin else None,
             )
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(input=stdin.encode() if stdin else None),
-                    timeout=self.timeout,
-                )
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
-                return None
-            except asyncio.CancelledError:
-                process.kill()
-                await process.wait()
-                raise
 
-            if process.returncode not in (0, None):
-                # Log stderr for debugging but still return stdout (many tools
-                # write useful output even on non-zero exit)
-                stderr_text = stderr.decode("utf-8", errors="replace").strip() if stderr else ""
-                if stderr_text:
-                    import logging
-                    logging.getLogger("beatrix.external_tools").debug(
-                        "%s exited %s: %s", cmd[0], process.returncode, stderr_text[:500]
+            if _streaming:
+                _log.debug("▶ %s", " ".join(str(a) for a in cmd))
+                stdout_lines: List[str] = []
+                stderr_lines: List[str] = []
+
+                async def _drain(stream, lines, tag):
+                    async for raw in stream:
+                        text = raw.decode("utf-8", errors="replace").rstrip()
+                        if text:
+                            _log.debug("[%s] %s", tag, text)
+                            lines.append(text)
+
+                try:
+                    if stdin:
+                        process.stdin.write(stdin.encode())
+                        await process.stdin.drain()
+                        process.stdin.close()
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            _drain(process.stdout, stdout_lines, "out"),
+                            _drain(process.stderr, stderr_lines, "err"),
+                        ),
+                        timeout=self.timeout,
                     )
+                    await process.wait()
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.wait()
+                    return None
+                except asyncio.CancelledError:
+                    process.kill()
+                    await process.wait()
+                    raise
 
-            result = stdout.decode("utf-8", errors="replace").strip()
+                result = "\n".join(stdout_lines)
+            else:
+                try:
+                    stdout, stderr = await asyncio.wait_for(
+                        process.communicate(input=stdin.encode() if stdin else None),
+                        timeout=self.timeout,
+                    )
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.wait()
+                    return None
+                except asyncio.CancelledError:
+                    process.kill()
+                    await process.wait()
+                    raise
 
-            # Save raw output if an output manager is available
+                if process.returncode not in (0, None):
+                    stderr_text = stderr.decode("utf-8", errors="replace").strip() if stderr else ""
+                    if stderr_text:
+                        logging.getLogger("beatrix.external_tools").debug(
+                            "%s exited %s: %s", cmd[0], process.returncode, stderr_text[:500]
+                        )
+
+                result = stdout.decode("utf-8", errors="replace").strip()
+
             if _om and result:
                 name = tool_name or self.BINARY_NAME
                 try:
                     _om.write_tool_output(name, result, phase=_phase)
                 except Exception:
-                    pass  # Output saving is best-effort
+                    pass
 
             return result
         except Exception:
@@ -160,10 +202,10 @@ class KatanaRunner(ExternalTool):
             self.path,
             "-u", url,
             "-d", str(depth),
-            "-silent",
-            "-nc",               # No color
             "-timeout", "10",    # Per-request timeout
         ]
+        if not self._verbose_mode:
+            cmd.extend(["-silent", "-nc"])
         if js_crawl:
             cmd.extend(["-jc"])  # JavaScript crawling
         if custom_headers:
@@ -231,6 +273,8 @@ class AmassRunner(ExternalTool):
         ]
         if passive:
             cmd.append("-passive")
+        if self._verbose_mode:
+            cmd.append("-v")
 
         output = await self._run(cmd)
         subdomains = []
@@ -270,11 +314,12 @@ class GospiderRunner(ExternalTool):
             self.path,
             "-s", url,
             "-d", str(depth),
-            "-q",            # Quiet mode
             "--no-redirect",
             "-t", "5",       # Threads
             "--timeout", "10",
         ]
+        if not self._verbose_mode:
+            cmd.append("-q")
         if custom_headers:
             for key, value in custom_headers.items():
                 cmd.extend(["-H", f"{key}: {value}"])
@@ -406,10 +451,41 @@ class WhatwebRunner(ExternalTool):
     Identifies web technologies, frameworks, CMS platforms, JS libraries,
     server software, and much more with 1800+ plugins.
 
-    Install: sudo pacman -S whatweb  (or apt/dnf equivalent)
+    Install: install.sh clones from source to ~/.local/share/whatweb/
     """
 
     BINARY_NAME = "whatweb"
+
+    def _find_binary(self) -> Optional[str]:
+        """Prefer source-installed whatweb over the apt package.
+
+        Apt-installed /usr/bin/whatweb breaks under RVM/rbenv because its
+        $LOAD_PATH.unshift(__dir__) adds /usr/bin, but whatweb.rb lives in
+        the system Ruby vendor path that RVM's Ruby doesn't load.  The source
+        install keeps whatweb.rb alongside the binary so __dir__ resolves
+        correctly regardless of which Ruby is active.
+        """
+        import subprocess as _sp
+        preferred = [
+            str(Path.home() / ".local/share/whatweb/whatweb"),
+            str(Path.home() / ".local/bin/whatweb"),
+        ]
+        for p in preferred:
+            if Path(p).exists():
+                try:
+                    if _sp.run([p, "--version"], capture_output=True, timeout=5).returncode == 0:
+                        return p
+                except Exception:
+                    pass
+        # Fall back to PATH, but verify the binary actually loads correctly.
+        system = shutil.which(self.BINARY_NAME)
+        if system:
+            try:
+                if _sp.run([system, "--version"], capture_output=True, timeout=5).returncode == 0:
+                    return system
+            except Exception:
+                pass
+        return None
 
     async def fingerprint(self, url: str) -> Dict[str, str]:
         """
@@ -420,13 +496,14 @@ class WhatwebRunner(ExternalTool):
         """
         cmd = [
             self.path,
-            "-q",               # Quiet
             "--log-json=-",     # JSON output to stdout
             "--max-redirects=3",
             "--open-timeout=10",
             "--read-timeout=15",
             url,
         ]
+        if not self._verbose_mode:
+            cmd.insert(1, "-q")
 
         output = await self._run(cmd)
         techs: Dict[str, str] = {}
@@ -466,9 +543,12 @@ class WebanalyzeRunner(ExternalTool):
     Uses the Wappalyzer fingerprint database to identify technologies.
 
     Install: go install github.com/rverton/webanalyze/cmd/webanalyze@latest
+             install.sh also downloads technologies.json to ~/.local/share/webanalyze/
     """
 
     BINARY_NAME = "webanalyze"
+    # technologies.json is downloaded here by install.sh; webanalyze fails without it.
+    _APPS_PATH: Path = Path.home() / ".local/share/webanalyze/technologies.json"
 
     async def fingerprint(self, url: str) -> Dict[str, str]:
         """
@@ -477,11 +557,17 @@ class WebanalyzeRunner(ExternalTool):
         Returns:
             Dict of technology_name → version/category
         """
+        if not self._APPS_PATH.exists():
+            _log = logging.getLogger("beatrix.tools.webanalyze")
+            _log.warning("technologies.json not found at %s — re-run install.sh to fix", self._APPS_PATH)
+            return {}
+
         cmd = [
             self.path,
             "-host", url,
             "-crawl", "1",
             "-silent",
+            "-apps", str(self._APPS_PATH),
         ]
 
         output = await self._run(cmd)
@@ -531,7 +617,6 @@ class DirsearchRunner(ExternalTool):
                 self.path,
                 "-u", url,
                 "-e", extensions,
-                "-q",                   # Quiet
                 "--format=json",
                 "-o", outfile.name,
                 "-t", "10",             # Threads
@@ -540,6 +625,8 @@ class DirsearchRunner(ExternalTool):
                 "--random-agent",
                 "--exclude-status=404,403,500,502,503",
             ]
+            if not self._verbose_mode:
+                cmd.insert(3, "-q")
 
             await self._run(cmd)
 
@@ -771,13 +858,14 @@ class DalfoxRunner(ExternalTool):
         cmd = [
             self.path,
             "url", url,
-            "--silence",
             "--no-color",
             "--format", "json",
             "--timeout", "10",
             "--delay", "100",    # ms between requests
             "--waf-evasion",
         ]
+        if not self._verbose_mode:
+            cmd.insert(2, "--silence")
 
         if param:
             cmd.extend(["-p", param])

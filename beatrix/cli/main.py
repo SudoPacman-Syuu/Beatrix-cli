@@ -1178,10 +1178,12 @@ def setup_cmd(ctx, check):
 @click.option("--login-url", default=None, help="Login page URL (auto-detected if omitted)")
 @click.option("--manual-login", is_flag=True, help="Open browser for manual login (handles OTP/captcha)")
 @click.option("--fresh-login", is_flag=True, help="Ignore saved session, force re-authentication")
+@click.option("--verbose", "-v", count=True,
+              help="Verbosity: -v show all info, -vv show finding details, -vvv enable debug logging")
 @click.pass_context
 def hunt(ctx, target, preset, ai, modules, output, targets_file,
          auth_config, cli_cookies, cli_headers, cli_token, auth_user, auth_pass,
-         login_user, login_pass, login_url, manual_login, fresh_login):
+         login_user, login_pass, login_url, manual_login, fresh_login, verbose):
     """
     Hunt for vulnerabilities on TARGET or a file of targets.
 
@@ -1252,6 +1254,7 @@ def hunt(ctx, target, preset, ai, modules, output, targets_file,
                     login_url=login_url,
                     manual_login=manual_login,
                     fresh_login=fresh_login,
+                    verbose=verbose,
                 )
                 all_findings.extend(h_findings)
                 if h_id:
@@ -1313,9 +1316,24 @@ def hunt(ctx, target, preset, ai, modules, output, targets_file,
     target = target_list[0]
 
     console.print(f"\n[bright_green]⚔️  Initiating hunt on [bold]{target}[/bold][/bright_green]")
-    console.print(f"[dim]   Preset: {preset} | AI: {'enabled' if ai else 'disabled'}[/dim]")
+    _verbose_label = ["", " | -v", " | -vv", " | -vvv"][min(verbose, 3)] if verbose else ""
+    console.print(f"[dim]   Preset: {preset} | AI: {'enabled' if ai else 'disabled'}{_verbose_label}[/dim]")
     if modules:
         console.print(f"[dim]   Modules: {', '.join(modules)}[/dim]")
+    if verbose >= 3:
+        import logging as _logging
+        from rich.logging import RichHandler as _RichHandler
+        _logging.basicConfig(
+            level=_logging.DEBUG,
+            format="%(name)s: %(message)s",
+            datefmt="[%X]",
+            handlers=[_RichHandler(console=console, rich_tracebacks=False, markup=False, show_path=False)],
+            force=True,
+        )
+        console.print("[dim]  [cyan]⚙  -vvv: all internal scanner debug output enabled[/cyan][/dim]")
+    elif verbose >= 2:
+        import logging as _logging
+        _logging.basicConfig(level=_logging.INFO, force=True)
 
     # Validate AI credentials early so the user isn't blindsided mid-scan
     if ai:
@@ -1385,9 +1403,14 @@ def hunt(ctx, target, preset, ai, modules, output, targets_file,
                     f"  [yellow]  ⚡ {data.get('scanner', '')} found {n} issue{'s' if n != 1 else ''}[/yellow]"
                 )
         elif event == "scanner_error":
-            progress_state["log"].append(
-                f"  [dim]  ✗ {data.get('scanner', '')}: {data.get('error', '')}[/dim]"
-            )
+            if verbose >= 2:
+                progress_state["log"].append(
+                    f"  [red]  ✗ {data.get('scanner', '')}: {data.get('error', '')}[/red]"
+                )
+            else:
+                progress_state["log"].append(
+                    f"  [dim]  ✗ {data.get('scanner', '')}: {data.get('error', '')}[/dim]"
+                )
         elif event == "finding":
             progress_state["findings_count"] += 1
             f = data.get("finding")
@@ -1398,14 +1421,23 @@ def hunt(ctx, target, preset, ai, modules, output, targets_file,
                 progress_state["log"].append(
                     f"    {icon} [{color}]{getattr(f, 'title', 'Finding')}[/{color}]"
                 )
+                if verbose >= 2:
+                    if getattr(f, 'url', None):
+                        progress_state["log"].append(f"      [dim]URL:      {f.url}[/dim]")
+                    if getattr(f, 'parameter', None):
+                        progress_state["log"].append(f"      [dim]Param:    {f.parameter}[/dim]")
+                    evidence = getattr(f, 'evidence', None)
+                    if evidence:
+                        ev_limit = 5000 if verbose >= 3 else 500
+                        progress_state["log"].append(f"      [dim]Evidence: {str(evidence)[:ev_limit]}[/dim]")
         elif event == "info":
             progress_state["log"].append(f"  ℹ  {data.get('message', '')}")
 
-        # Keep log to last 50 entries — use lock for thread safety
-        # with the printer thread that reads from the same list
-        if len(progress_state["log"]) > 50:
+        # Log buffer: unlimited at -vvv, 500 at -vv, 200 at -v, 50 default
+        _log_cap = None if verbose >= 3 else (500 if verbose >= 2 else (200 if verbose >= 1 else 50))
+        if _log_cap is not None and len(progress_state["log"]) > _log_cap:
             with _log_lock:
-                excess = len(progress_state["log"]) - 50
+                excess = len(progress_state["log"]) - _log_cap
                 del progress_state["log"][:excess]
                 _printed_count[0] = max(_printed_count[0] - excess, 0)
 
@@ -1668,7 +1700,8 @@ def _hunt_single_target(target, preset="standard", ai=False, modules=None,
                         output=None, auth_config=None, cli_cookies=None,
                         cli_headers=None, cli_token=None, auth_user=None,
                         auth_pass=None, login_user=None, login_pass=None,
-                        login_url=None, manual_login=False, fresh_login=False):
+                        login_url=None, manual_login=False, fresh_login=False,
+                        verbose=0):
     """
     Run a full hunt on a single target. Used by both single-target and
     multi-target (--file) modes.
@@ -1713,9 +1746,14 @@ def _hunt_single_target(target, preset="standard", ai=False, modules=None,
                     f"  [yellow]  ⚡ {data.get('scanner', '')} found {n} issue{'s' if n != 1 else ''}[/yellow]"
                 )
         elif event == "scanner_error":
-            progress_state["log"].append(
-                f"  [dim]  ✗ {data.get('scanner', '')}: {data.get('error', '')}[/dim]"
-            )
+            if verbose >= 2:
+                progress_state["log"].append(
+                    f"  [red]  ✗ {data.get('scanner', '')}: {data.get('error', '')}[/red]"
+                )
+            else:
+                progress_state["log"].append(
+                    f"  [dim]  ✗ {data.get('scanner', '')}: {data.get('error', '')}[/dim]"
+                )
         elif event == "finding":
             progress_state["findings_count"] += 1
             f = data.get("finding")
@@ -1726,11 +1764,22 @@ def _hunt_single_target(target, preset="standard", ai=False, modules=None,
                 progress_state["log"].append(
                     f"    {icon} [{color}]{getattr(f, 'title', 'Finding')}[/{color}]"
                 )
+                if verbose >= 2:
+                    if getattr(f, 'url', None):
+                        progress_state["log"].append(f"      [dim]URL:      {f.url}[/dim]")
+                    if getattr(f, 'parameter', None):
+                        progress_state["log"].append(f"      [dim]Param:    {f.parameter}[/dim]")
+                    evidence = getattr(f, 'evidence', None)
+                    if evidence:
+                        ev_limit = 5000 if verbose >= 3 else 500
+                        progress_state["log"].append(f"      [dim]Evidence: {str(evidence)[:ev_limit]}[/dim]")
         elif event == "info":
             progress_state["log"].append(f"  ℹ  {data.get('message', '')}")
 
-        if len(progress_state["log"]) > 50:
-            excess = len(progress_state["log"]) - 50
+        # Log buffer: unlimited at -vvv, 500 at -vv, 200 at -v, 50 default
+        _log_cap = None if verbose >= 3 else (500 if verbose >= 2 else (200 if verbose >= 1 else 50))
+        if _log_cap is not None and len(progress_state["log"]) > _log_cap:
+            excess = len(progress_state["log"]) - _log_cap
             del progress_state["log"][:excess]
             _printed_count[0] = max(_printed_count[0] - excess, 0)
 
@@ -2727,8 +2776,10 @@ def probe(ctx, target):
 @click.argument("target")
 @click.option("--module", "-m", required=True,
               help="Module to execute (run 'beatrix arsenal' for list)")
+@click.option("--verbose", "-v", count=True,
+              help="Verbosity: -v, -vv, -vvv (enable debug logging)")
 @click.pass_context
-def strike(ctx, target, module):
+def strike(ctx, target, module, verbose):
     """
     Execute a single attack MODULE against TARGET.
 
@@ -2741,6 +2792,18 @@ def strike(ctx, target, module):
     Run 'beatrix arsenal' to see all available modules.
     """
     console.print(f"\n[red]⚔️  Striking {target} with [bold]{module}[/bold][/red]\n")
+
+    if verbose >= 3:
+        import logging as _logging
+        from rich.logging import RichHandler as _RichHandler
+        _logging.basicConfig(
+            level=_logging.DEBUG,
+            format="%(name)s: %(message)s",
+            datefmt="[%X]",
+            handlers=[_RichHandler(console=console, rich_tracebacks=False, markup=False, show_path=False)],
+            force=True,
+        )
+        console.print("[dim]  [cyan]⚙  -vvv: all internal scanner debug output enabled[/cyan][/dim]\n")
 
     engine = BeatrixEngine()
 
@@ -2760,8 +2823,18 @@ def strike(ctx, target, module):
             if finding.url:
                 console.print(f"      [dim]{finding.url}[/dim]")
             if finding.evidence:
-                evidence_str = str(finding.evidence)[:200]
+                ev_limit = 5000 if verbose >= 3 else (2000 if verbose >= 2 else 200)
+                evidence_str = str(finding.evidence)[:ev_limit]
                 console.print(f"      [dim]Evidence: {evidence_str}[/dim]")
+            if verbose >= 2:
+                if getattr(finding, 'parameter', None):
+                    console.print(f"      [dim]Parameter: {finding.parameter}[/dim]")
+                if getattr(finding, 'request', None):
+                    req_str = str(finding.request)[:2000]
+                    console.print(f"      [dim cyan]Request:[/dim cyan]\n      [dim]{req_str}[/dim]")
+                if getattr(finding, 'response', None):
+                    res_str = str(finding.response)[:2000]
+                    console.print(f"      [dim cyan]Response:[/dim cyan]\n      [dim]{res_str}[/dim]")
     except Exception as e:
         console.print(f"[red]Error: {e}[/red]")
         sys.exit(1)
@@ -3797,6 +3870,271 @@ def auth_sessions(clear, clear_all):
             s["saved_at"],
         )
     console.print(table)
+
+
+@auth_group.command("import")
+@click.argument("target")
+@click.argument("file", type=click.Path(exists=True))
+@click.option("--format", "fmt", type=click.Choice(["har", "cookies", "auto"]), default="auto",
+              help="File format: har (HTTP Archive JSON), cookies (header string), auto (detect from extension/content)")
+def auth_import_cmd(target, file, fmt):
+    """Import a session from a HAR archive or cookie string file.
+
+    \b
+    HAR files capture real browser traffic including all request headers,
+    HttpOnly cookies, and auth tokens — the most complete import method.
+
+    \b
+    How to export a HAR from Chrome/Firefox/Edge:
+      1. Open DevTools (F12) → Network tab
+      2. Log in and complete any OTP/2FA
+      3. Right-click any request → 'Save all as HAR with content'
+      4. beatrix auth import example.com session.har
+
+    \b
+    Cookie string format (one line):
+      name=value; name2=value2; session=abc123
+
+    \b
+    Examples:
+        beatrix auth import example.com session.har
+        beatrix auth import api.example.com traffic.har
+        beatrix auth import example.com cookies.txt --format cookies
+    """
+    import json as _json
+    from pathlib import Path as _Path
+    from beatrix.core.auto_login import LoginResult, save_session
+
+    file_path = _Path(file)
+
+    # ── Detect format ─────────────────────────────────────────────────────────
+    if fmt == "auto":
+        suffix = file_path.suffix.lower()
+        if suffix == ".har":
+            fmt = "har"
+        else:
+            # Peek at content
+            try:
+                head = file_path.read_text(encoding="utf-8", errors="replace")[:200].strip()
+                fmt = "har" if head.startswith("{") and '"log"' in head else "cookies"
+            except Exception:
+                fmt = "cookies"
+
+    console.print()
+    console.print(Panel.fit(
+        f"[bold]Importing session for:[/bold] {target}\n"
+        f"[dim]File: {file_path.name}  Format: {fmt}[/dim]",
+        title="[bold bright_cyan]  Session Import[/bold bright_cyan]",
+        border_style="cyan",
+    ))
+    console.print()
+
+    if fmt == "har":
+        result = _import_from_har(target, file_path)
+    else:
+        result = _import_from_cookie_string(target, file_path)
+
+    if result is None:
+        return
+
+    # ── Resolve target domain for saving ──────────────────────────────────────
+    from urllib.parse import urlparse as _urlparse
+    _parsed = _urlparse(target if "://" in target else f"https://{target}")
+    domain = _parsed.netloc or target
+
+    save_session(domain, result)
+
+    # ── Summary table ─────────────────────────────────────────────────────────
+    table = Table(title="Imported Session", border_style="green", show_header=False)
+    table.add_column("Field", style="bold")
+    table.add_column("Value")
+    table.add_row("Domain", domain)
+    table.add_row("Cookies", str(len(result.cookies)))
+    if result.cookies:
+        table.add_row("Cookie names", ", ".join(list(result.cookies.keys())[:8]))
+    if result.headers:
+        table.add_row("Auth headers", ", ".join(result.headers.keys()))
+    if result.token:
+        table.add_row("Bearer token", result.token[:40] + "...")
+    table.add_row("Method", result.method_used)
+    console.print(table)
+    console.print()
+    console.print("[green]Session saved. Run your scan:[/green]")
+    console.print(f"[dim]  beatrix hunt {target}[/dim]")
+    console.print()
+
+
+def _import_from_har(target: str, file_path) -> "Optional[Any]":
+    """Parse a HAR file and extract the best authenticated session for target."""
+    import json as _json
+    from urllib.parse import urlparse as _urlparse
+
+    try:
+        har = _json.loads(file_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception as e:
+        console.print(f"[red]Could not parse HAR file: {e}[/red]")
+        return None
+
+    entries = []
+    try:
+        entries = har["log"]["entries"]
+    except (KeyError, TypeError):
+        console.print("[red]Invalid HAR format — expected log.entries array[/red]")
+        return None
+
+    # Extract target domain for filtering
+    _parsed = _urlparse(target if "://" in target else f"https://{target}")
+    target_host = _parsed.netloc or target
+    # Strip port for matching
+    target_domain = target_host.split(":")[0]
+
+    # Session cookie names that strongly indicate an authenticated session
+    SESSION_COOKIE_NAMES = {
+        "session", "sessionid", "session_id", "sid", "ssid",
+        "connect.sid", "phpsessid", "jsessionid", "laravel_session",
+        "asp.net_sessionid", "_session_id", "rack.session",
+        "auth", "token", "jwt", "access_token",
+    }
+
+    # Auth header names to capture
+    AUTH_HEADER_NAMES = {
+        "authorization", "x-api-key", "x-auth-token", "x-access-token",
+        "x-session-token", "api-key", "x-token",
+    }
+
+    best_cookies: dict = {}
+    best_headers: dict = {}
+    best_token: str = ""
+    best_score = -1
+
+    for entry in entries:
+        try:
+            req = entry.get("request", {})
+            req_url = req.get("url", "")
+            req_host = _urlparse(req_url).netloc.split(":")[0]
+
+            # Only consider requests to the target domain (or subdomains)
+            if req_host != target_domain and not req_host.endswith("." + target_domain):
+                continue
+
+            raw_headers = req.get("headers", [])
+            h_lower = {h["name"].lower(): h["value"] for h in raw_headers if "name" in h and "value" in h}
+
+            # Extract Cookie header
+            cookie_str = h_lower.get("cookie", "")
+            entry_cookies: dict = {}
+            if cookie_str:
+                for part in cookie_str.split(";"):
+                    part = part.strip()
+                    if "=" in part:
+                        k, _, v = part.partition("=")
+                        entry_cookies[k.strip()] = v.strip()
+
+            # Extract auth headers
+            entry_headers: dict = {}
+            entry_token = ""
+            for hname, hval in h_lower.items():
+                if hname in AUTH_HEADER_NAMES:
+                    entry_headers[hname.title().replace("X-", "X-")] = hval
+                    if hname == "authorization" and hval.lower().startswith("bearer "):
+                        entry_token = hval[7:].strip()
+
+            if not entry_cookies and not entry_headers:
+                continue
+
+            # Score: prefer entries with known session cookies
+            score = len(entry_cookies) + len(entry_headers) * 2
+            for cname in entry_cookies:
+                if cname.lower() in SESSION_COOKIE_NAMES:
+                    score += 5
+            if entry_token:
+                score += 10
+
+            if score > best_score:
+                best_score = score
+                best_cookies = entry_cookies
+                best_headers = entry_headers
+                best_token = entry_token
+
+        except Exception:
+            continue
+
+    if not best_cookies and not best_headers:
+        console.print(f"[yellow]No authenticated requests found for {target_domain} in this HAR file.[/yellow]")
+        console.print("[dim]  Make sure you exported the HAR after logging in, and that the")
+        console.print(f"[dim]  domain matches. Entries in file: {len(entries)}[/dim]")
+        return None
+
+    console.print(f"[green]Found {len(best_cookies)} cookies and {len(best_headers)} auth headers[/green]")
+    if best_token:
+        console.print(f"[green]Bearer token: {best_token[:40]}...[/green]")
+
+    from beatrix.core.auto_login import LoginResult
+    return LoginResult(
+        success=True,
+        cookies=best_cookies,
+        headers=best_headers,
+        token=best_token or None,
+        method_used="har_import",
+        login_url=target,
+        message=f"Imported from HAR: {len(best_cookies)} cookies, {len(best_headers)} headers",
+    )
+
+
+def _import_from_cookie_string(target: str, file_path) -> "Optional[Any]":
+    """Parse a plain cookie string file and create a session."""
+    try:
+        content = file_path.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception as e:
+        console.print(f"[red]Could not read file: {e}[/red]")
+        return None
+
+    cookies: dict = {}
+    headers: dict = {}
+    token: str = ""
+
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Bearer token line
+        if line.lower().startswith("authorization:") or line.lower().startswith("bearer "):
+            val = line.split(":", 1)[-1].strip() if ":" in line else line
+            if val.lower().startswith("bearer "):
+                token = val[7:].strip()
+            else:
+                token = val
+            headers["Authorization"] = f"Bearer {token}"
+            continue
+        # Cookie: header line
+        if line.lower().startswith("cookie:"):
+            line = line[7:].strip()
+        # Parse as cookie string
+        for part in line.split(";"):
+            part = part.strip()
+            if "=" in part:
+                k, _, v = part.partition("=")
+                cookies[k.strip()] = v.strip()
+
+    if not cookies and not headers:
+        console.print("[red]No cookies or auth headers found in file.[/red]")
+        console.print("[dim]  Expected format: name=value; name2=value2[/dim]")
+        console.print("[dim]  Or:              Cookie: name=value; name2=value2[/dim]")
+        console.print("[dim]  Or:              Authorization: Bearer eyJ...[/dim]")
+        return None
+
+    console.print(f"[green]Parsed {len(cookies)} cookies" + (f" + bearer token" if token else "") + "[/green]")
+
+    from beatrix.core.auto_login import LoginResult
+    return LoginResult(
+        success=True,
+        cookies=cookies,
+        headers=headers,
+        token=token or None,
+        method_used="cookie_import",
+        login_url=target,
+        message=f"Imported from file: {len(cookies)} cookies",
+    )
 
 
 # =============================================================================

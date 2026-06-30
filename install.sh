@@ -357,7 +357,9 @@ ensure_go() {
     fi
 
     info "Installing Go toolchain..."
-    local GO_VERSION="1.22.5"
+    local GO_VERSION
+    GO_VERSION=$(curl -sSL "https://go.dev/VERSION?m=text" 2>/dev/null | head -1 | sed 's/^go//' | tr -d '[:space:]')
+    [[ -z "$GO_VERSION" || ! "$GO_VERSION" =~ ^[0-9]+\.[0-9] ]] && GO_VERSION="1.22.5"
     local ARCH
     case "$(uname -m)" in
         x86_64)  ARCH="amd64" ;;
@@ -430,7 +432,6 @@ install_external_tools() {
             SYS_PKGS=(
                 [nmap]="nmap"
                 [sqlmap]="sqlmap"
-                [whatweb]="whatweb"
                 [adb]="android-tools-adb"
             )
             ;;
@@ -438,7 +439,6 @@ install_external_tools() {
             SYS_PKGS=(
                 [nmap]="nmap"
                 [sqlmap]="sqlmap"
-                [whatweb]="whatweb"
                 [adb]="android-tools"
             )
             ;;
@@ -446,7 +446,6 @@ install_external_tools() {
             SYS_PKGS=(
                 [nmap]="nmap"
                 [sqlmap]="sqlmap"
-                [whatweb]="whatweb"
                 [adb]="android-tools"
             )
             ;;
@@ -455,7 +454,7 @@ install_external_tools() {
             ;;
     esac
 
-    for tool in nmap sqlmap whatweb adb; do
+    for tool in nmap sqlmap adb; do
         if command_exists "$tool"; then
             success "$tool (already installed)"
             ((skipped++))
@@ -473,6 +472,48 @@ install_external_tools() {
             ((failed++))
         fi
     done
+
+    # ── whatweb: install from source to avoid Ruby load path issues ──
+    # Apt-installed whatweb breaks under RVM/rbenv because /usr/bin/whatweb
+    # requires whatweb.rb at the system Ruby vendor path, which RVM's Ruby
+    # doesn't include in its load path. Source install is self-contained.
+    local WHATWEB_SRC="$HOME/.local/share/whatweb"
+    local WHATWEB_BIN="$HOME/.local/bin/whatweb"
+    if [[ -x "$WHATWEB_SRC/whatweb" ]] && "$WHATWEB_SRC/whatweb" --version &>/dev/null 2>&1; then
+        success "whatweb (already installed from source)"
+        ((skipped++))
+    elif command_exists whatweb && whatweb --version &>/dev/null 2>&1; then
+        success "whatweb (already installed)"
+        ((skipped++))
+    else
+        info "Installing whatweb (from source)..."
+        if ! command_exists ruby; then
+            warn "whatweb requires ruby — install ruby first"
+            ((failed++))
+        elif ! command_exists git; then
+            warn "whatweb source install requires git"
+            ((failed++))
+        else
+            rm -rf "$WHATWEB_SRC"
+            if git clone --depth 1 https://github.com/urbanadventurer/WhatWeb.git "$WHATWEB_SRC" &>/dev/null; then
+                chmod +x "$WHATWEB_SRC/whatweb"
+                mkdir -p "$HOME/.local/bin"
+                ln -sf "$WHATWEB_SRC/whatweb" "$WHATWEB_BIN"
+                # Install required gems into whatever Ruby is active (RVM-aware)
+                command_exists gem && gem install addressable --quiet &>/dev/null || true
+                if "$WHATWEB_SRC/whatweb" --version &>/dev/null 2>&1; then
+                    success "whatweb (from source)"
+                    ((installed++))
+                else
+                    warn "whatweb cloned but smoke test failed — run 'gem install addressable' if missing"
+                    ((failed++))
+                fi
+            else
+                warn "Failed to clone WhatWeb repository"
+                ((failed++))
+            fi
+        fi
+    fi
 
     # ── 2. Go-based tools ────────────────────────────────
     echo ""
@@ -661,15 +702,62 @@ WRAPPER
     [[ -x "$VENV_DIR/bin/python" ]] && PW_PYTHON="$VENV_DIR/bin/python"
 
     # playwright is a core pip dependency (already installed with Beatrix).
-    # Here we just ensure the Chromium browser binary is downloaded.
+    # Here we ensure the Chromium browser binary is downloaded and on PATH.
     if $PW_PYTHON -c 'import playwright' &>/dev/null; then
         info "Installing Chromium browser for playwright..."
-        $PW_PYTHON -m playwright install chromium --with-deps &>/dev/null && \
-            success "playwright + Chromium" || \
-            { success "playwright (run 'playwright install chromium' for browser)"; }
-        ((skipped++))
+
+        # When running as root (sudo bash install.sh), Playwright downloads Chromium
+        # to $HOME/.cache/ms-playwright. Under sudo, HOME=/root — but beatrix runs
+        # as the invoking user, so we must override HOME so Chromium lands in the
+        # real user's cache directory. The --with-deps apt step still runs as root.
+        local _pw_home="$HOME"
+        if [[ -n "${SUDO_USER:-}" && "$EUID" -eq 0 ]]; then
+            _pw_home=$(getent passwd "$SUDO_USER" | cut -d: -f6 2>/dev/null || echo "$HOME")
+            info "  Using HOME=$_pw_home for Chromium download (SUDO_USER=$SUDO_USER)"
+        fi
+
+        local _pw_install_ok=false
+        local _pw_err
+        _pw_err=$(HOME="$_pw_home" $PW_PYTHON -m playwright install chromium --with-deps 2>&1) && \
+            _pw_install_ok=true
+
+        if [[ "$_pw_install_ok" == "false" ]]; then
+            # --with-deps may fail if apt is unavailable; retry without it
+            _pw_err=$(HOME="$_pw_home" $PW_PYTHON -m playwright install chromium 2>&1) && \
+                _pw_install_ok=true
+        fi
+
+        if [[ "$_pw_install_ok" == "true" ]]; then
+            # Verify Chromium was actually downloaded (not just "already installed")
+            local _chromium_ok=false
+            for _cache in "$_pw_home/.cache/ms-playwright" "$HOME/.cache/ms-playwright"; do
+                if ls "$_cache"/chromium-* &>/dev/null 2>&1 || ls "$_cache"/chromium_headless_shell-* &>/dev/null 2>&1; then
+                    _chromium_ok=true
+                    break
+                fi
+            done
+
+            # Symlink playwright CLI so it's usable directly from the terminal
+            mkdir -p "$HOME/.local/bin"
+            if [[ -x "$VENV_DIR/bin/playwright" ]]; then
+                ln -sf "$VENV_DIR/bin/playwright" "$HOME/.local/bin/playwright" 2>/dev/null || true
+            fi
+
+            if [[ "$_chromium_ok" == "true" ]]; then
+                success "playwright + Chromium"
+                ((installed++))
+            else
+                warn "playwright installed but Chromium binary not found — try: $PW_PYTHON -m playwright install chromium"
+                ((failed++))
+            fi
+        else
+            warn "playwright Chromium install failed:"
+            warn "  $_pw_err"
+            warn "  Fix: run '$PW_PYTHON -m playwright install chromium --with-deps'"
+            ((failed++))
+        fi
     else
-        warn "playwright Python package not found — reinstall Beatrix"
+        warn "playwright Python package not found — reinstall Beatrix first"
         ((failed++))
     fi
 
@@ -688,6 +776,28 @@ WRAPPER
         else
             warn "Failed to install webanalyze"
             ((failed++))
+        fi
+    fi
+
+    # Download technologies.json (required at runtime — webanalyze errors without it).
+    # Always refresh so the fingerprint database stays current across reinstalls.
+    local WEBANALYZE_DATA="$HOME/.local/share/webanalyze"
+    local WEBANALYZE_DB="$WEBANALYZE_DATA/technologies.json"
+    mkdir -p "$WEBANALYZE_DATA"
+    info "Fetching webanalyze technology database..."
+    if curl -sSL "https://raw.githubusercontent.com/rverton/webanalyze/master/technologies.json" \
+            -o "$WEBANALYZE_DB" 2>/dev/null && [[ -s "$WEBANALYZE_DB" ]]; then
+        success "webanalyze technologies database"
+    else
+        # Fall back to copying from the Go module cache if curl failed
+        local cached_db
+        cached_db=$(find "${GOPATH:-$HOME/go}/pkg/mod" -name "technologies.json" \
+                        -path "*/webanalyze*" 2>/dev/null | head -1)
+        if [[ -n "$cached_db" ]]; then
+            cp "$cached_db" "$WEBANALYZE_DB"
+            success "webanalyze technologies database (from module cache)"
+        else
+            warn "Could not fetch webanalyze technologies database — run 'webanalyze -update' after install"
         fi
     fi
 
