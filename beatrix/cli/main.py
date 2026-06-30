@@ -477,7 +477,7 @@ Settings are stored in [bold]~/.beatrix/config.yaml[/bold].
 
 [bold cyan]CONFIG KEYS:[/bold cyan]
   scanning.threads      Number of concurrent threads (default: 50)
-  scanning.rate_limit   Requests per second (default: 100)
+  scanning.rate_limit   Requests per second (default: 10)
   scanning.timeout      HTTP timeout in seconds (default: 10)
   ai.enabled            Enable AI features (true/false)
   ai.provider           AI provider: "bedrock" or "anthropic"
@@ -1178,12 +1178,15 @@ def setup_cmd(ctx, check):
 @click.option("--login-url", default=None, help="Login page URL (auto-detected if omitted)")
 @click.option("--manual-login", is_flag=True, help="Open browser for manual login (handles OTP/captcha)")
 @click.option("--fresh-login", is_flag=True, help="Ignore saved session, force re-authentication")
+@click.option("--rate-limit", "rate_limit", type=int, default=None,
+              help="Max requests per second across all scanners (default: 10). "
+                   "Use lower values against WAF-protected targets.")
 @click.option("--verbose", "-v", count=True,
               help="Verbosity: -v show all info, -vv show finding details, -vvv enable debug logging")
 @click.pass_context
 def hunt(ctx, target, preset, ai, modules, output, targets_file,
          auth_config, cli_cookies, cli_headers, cli_token, auth_user, auth_pass,
-         login_user, login_pass, login_url, manual_login, fresh_login, verbose):
+         login_user, login_pass, login_url, manual_login, fresh_login, rate_limit, verbose):
     """
     Hunt for vulnerabilities on TARGET or a file of targets.
 
@@ -1450,7 +1453,11 @@ def hunt(ctx, target, preset, ai, modules, output, targets_file,
     except Exception as _som_err:
         console.print(f"[yellow]  ⚠  Scan output directory unavailable: {_som_err}[/yellow]")
 
-    engine = BeatrixEngine(on_event=_on_event, output_manager=output_mgr)
+    from beatrix.core.engine import EngineConfig
+    _engine_config = EngineConfig()
+    if rate_limit is not None:
+        _engine_config.rate_limit = rate_limit
+    engine = BeatrixEngine(config=_engine_config, on_event=_on_event, output_manager=output_mgr)
 
     # ── Load authentication credentials ───────────────────────────────────
     auth_creds = None
@@ -2909,7 +2916,7 @@ def config(ctx, show, set_opt):
     Examples:
         beatrix config --show
         beatrix config --set ai.enabled true
-        beatrix config --set scanning.rate_limit 50
+        beatrix config --set scanning.rate_limit 50  # or use --rate-limit on hunt
 
     \b
     Run 'beatrix help config' for all available keys.

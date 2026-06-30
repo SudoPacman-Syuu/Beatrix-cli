@@ -36,7 +36,7 @@ class EngineConfig:
     """Engine configuration"""
     # Scanning
     threads: int = 50
-    rate_limit: int = 100  # requests per second
+    rate_limit: int = 10  # requests per second
     timeout: int = 10
 
     # AI
@@ -64,7 +64,7 @@ class EngineConfig:
 
         return cls(
             threads=data.get("scanning", {}).get("threads", 50),
-            rate_limit=data.get("scanning", {}).get("rate_limit", 100),
+            rate_limit=data.get("scanning", {}).get("rate_limit", 10),
             timeout=data.get("scanning", {}).get("timeout", 10),
             ai_enabled=data.get("ai", {}).get("enabled", False),
             ai_provider=data.get("ai", {}).get("provider", "bedrock"),
@@ -149,6 +149,7 @@ class BeatrixEngine:
 
         scanner_config = {
             "rate_limit": self.config.rate_limit,
+            "nuclei_rate_limit": self.config.rate_limit,  # nuclei inherits global rate
             "timeout": self.config.timeout,
         }
 

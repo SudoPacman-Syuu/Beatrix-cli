@@ -344,7 +344,7 @@ class KillChainExecutor:
     # Nuclei runs 12,600+ templates across ALL discovered URLs — needs real time.
     # Network pipeline phases have their own internal timeouts.
     SCANNER_TIMEOUT_OVERRIDES = {
-        "nuclei": 3600,       # 1 hour — nuclei manages its own internal timeout
+        # nuclei has no outer timeout — it runs until complete (or nuclei_timeout config is set)
         "nmap_nse": 1800,     # 30 minutes — full NSE pipeline
         "ssh_auditor": 900,   # 15 minutes — SSH fingerprint + cred checks
         "packet_crafter": 900,  # 15 minutes — firewall analysis
@@ -2311,10 +2311,13 @@ class KillChainExecutor:
                     self._emit("scanner_error", scanner="nuclei_recon", error=str(e))
                 return result
 
-            scanner_tasks.append(asyncio.wait_for(
-                _nuclei_recon_task(),
-                timeout=self.SCANNER_TIMEOUT_OVERRIDES.get("nuclei", self.SCANNER_TIMEOUT)
-            ))
+            _nuclei_outer_timeout = self.SCANNER_TIMEOUT_OVERRIDES.get("nuclei", None)
+            if _nuclei_outer_timeout is not None:
+                scanner_tasks.append(asyncio.wait_for(
+                    _nuclei_recon_task(), timeout=_nuclei_outer_timeout
+                ))
+            else:
+                scanner_tasks.append(_nuclei_recon_task())
 
         concurrent_results = await asyncio.gather(*scanner_tasks, return_exceptions=True)
         for r in concurrent_results:
@@ -3312,7 +3315,7 @@ class KillChainExecutor:
             # --- Exploit pass: CVEs, injections, auth bypass, workflows ---
             self._emit("info", message=f"Nuclei exploit scan: {len(all_urls)} URLs with intelligent template selection")
             exploit_result = {"findings": [], "assets": [], "context": {}, "modules": ["nuclei_exploit"], "requests": 0}
-            nuclei_timeout = self.SCANNER_TIMEOUT_OVERRIDES.get("nuclei", self.SCANNER_TIMEOUT)
+            nuclei_timeout = self.SCANNER_TIMEOUT_OVERRIDES.get("nuclei", None)
             try:
                 exploit_ctx = ScanContext.from_url(url)
                 exploit_ctx.extra = {
@@ -3328,7 +3331,10 @@ class KillChainExecutor:
                             exploit_result["findings"].append(finding)
                             self._emit("finding", scanner="nuclei", finding=finding)
 
-                await asyncio.wait_for(_run_exploit(), timeout=nuclei_timeout)
+                if nuclei_timeout is not None:
+                    await asyncio.wait_for(_run_exploit(), timeout=nuclei_timeout)
+                else:
+                    await _run_exploit()
                 results.append(exploit_result)
                 self._emit("scanner_done", scanner="nuclei_exploit", findings=len(exploit_result["findings"]))
             except asyncio.TimeoutError:
@@ -3353,7 +3359,10 @@ class KillChainExecutor:
                             headless_result["findings"].append(finding)
                             self._emit("finding", scanner="nuclei_headless", finding=finding)
 
-                await asyncio.wait_for(_run_headless(), timeout=nuclei_timeout)
+                if nuclei_timeout is not None:
+                    await asyncio.wait_for(_run_headless(), timeout=nuclei_timeout)
+                else:
+                    await _run_headless()
                 if headless_result["findings"]:
                     results.append(headless_result)
                     self._emit("scanner_done", scanner="nuclei_headless", findings=len(headless_result["findings"]))

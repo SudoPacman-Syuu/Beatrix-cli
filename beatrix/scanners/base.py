@@ -8,7 +8,9 @@ Inspired by Sweet Scanner's IScannerCheck interface.
 import asyncio
 import logging
 import random
+import time
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -179,6 +181,77 @@ class ScanContext:
         )
 
 
+class _AdaptiveRateLimiter:
+    """Token-bucket rate limiter that backs off only on HTTP 429s.
+
+    Safe discriminators (trigger backoff):
+      - HTTP 429 Too Many Requests — the explicit rate-limit signal
+      - Connection-level failures (ConnectError, timeout) are NOT used here;
+        the circuit breaker in BaseScanner handles dead-host detection instead.
+
+    Ignored (never trigger backoff):
+      - 400, 401, 403, 404, 405, 500, 502, 503 — application-layer responses
+        that happen constantly during security testing (WAF blocks, auth checks,
+        injection probes returning error pages, etc.).
+
+    Recovery: after _RECOVERY_S seconds without a 429 window trigger, rate
+    is restored by 25% toward the original ceiling.  This prevents permanent
+    rate degradation when a server was temporarily overloaded.
+    """
+
+    _WINDOW_S: float = 60.0      # rolling window for 429 counting
+    _BACKOFF_AT: int = 3         # 429s in window before halving rate
+    _RECOVERY_S: float = 120.0   # seconds before attempting rate recovery
+    _RECOVER_FACTOR: float = 1.25
+
+    def __init__(self, rate: float) -> None:
+        self._rate = rate                   # current tokens/sec
+        self._ceiling = rate                # max (starting) rate
+        self._floor = max(1.0, rate * 0.1) # minimum: 10% of start, ≥ 1 rps
+        self._tokens = rate
+        self._last_tick = time.monotonic()
+        self._last_recovery = time.monotonic()
+        self._window_429: deque = deque()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        """Wait until a token is available at the current rate."""
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_tick
+            self._last_tick = now
+            self._tokens = min(self._ceiling, self._tokens + elapsed * self._rate)
+            if self._tokens < 1.0:
+                wait = (1.0 - self._tokens) / max(self._rate, 0.01)
+                self._tokens = 0.0
+                await asyncio.sleep(wait)
+            else:
+                self._tokens -= 1.0
+            # Gradual recovery toward original rate
+            if (now - self._last_recovery >= self._RECOVERY_S
+                    and self._rate < self._ceiling):
+                self._rate = min(self._ceiling, self._rate * self._RECOVER_FACTOR)
+                self._last_recovery = now
+
+    def record_429(self) -> None:
+        """Signal that a 429 response was received — may trigger backoff."""
+        now = time.monotonic()
+        self._window_429.append(now)
+        cutoff = now - self._WINDOW_S
+        while self._window_429 and self._window_429[0] < cutoff:
+            self._window_429.popleft()
+        if len(self._window_429) >= self._BACKOFF_AT:
+            new_rate = max(self._floor, self._rate * 0.5)
+            if new_rate < self._rate:
+                logger.info(
+                    f"[rate] 429 backoff triggered: {self._rate:.1f} → {new_rate:.1f} rps "
+                    f"({len(self._window_429)} 429s in {self._WINDOW_S:.0f}s window)"
+                )
+                self._rate = new_rate
+                self._last_recovery = now
+                self._window_429.clear()
+
+
 class BaseScanner(ABC):
     """
     Abstract base class for all BEATRIX scanners.
@@ -213,9 +286,10 @@ class BaseScanner(ABC):
         self.client: Optional[httpx.AsyncClient] = None
         self.findings: List[Finding] = []
 
-        # Rate limiting
+        # Rate limiting — semaphore caps concurrency; adaptive limiter caps req/sec
         self.rate_limit = self.config.get("rate_limit", 10)
         self.semaphore = asyncio.Semaphore(self.rate_limit)
+        self._rate_limiter = _AdaptiveRateLimiter(float(self.rate_limit))
 
         # G-03: Per-scanner timeout — config overrides class default
         self.timeout = self.config.get("timeout", self.DEFAULT_TIMEOUT)
@@ -377,6 +451,10 @@ class BaseScanner(ABC):
             jitter = random.uniform(0.05, 0.3) + self._waf_throttle_delay
             await asyncio.sleep(jitter)
 
+        # Enforce req/sec rate limit before acquiring concurrency slot.
+        # _AdaptiveRateLimiter only backs off on 429 — never on 4xx/5xx payloads.
+        await self._rate_limiter.acquire()
+
         rate_retries = 0
         waf_retries = 0
         while True:
@@ -414,7 +492,9 @@ class BaseScanner(ABC):
 
                 await asyncio.sleep(min(retry_after, 30))
                 rate_retries += 1
-                # Engage adaptive throttle — WAF is rate-limiting us
+                # Signal adaptive rate limiter — may halve req/sec if threshold hit
+                self._rate_limiter.record_429()
+                # Also engage per-request jitter delay
                 self._waf_throttle_delay = min(
                     self._waf_throttle_delay + 0.5, 3.0
                 )

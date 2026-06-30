@@ -184,8 +184,8 @@ class NucleiScanner(BaseScanner):
         super().__init__(config)
         self.nuclei_path = self._find_nuclei()
 
-        # Timeouts
-        self._base_timeout = self.config.get("nuclei_timeout", 600)
+        # Timeouts — None means no wall-clock limit (run until nuclei finishes)
+        self._base_timeout = self.config.get("nuclei_timeout", None)
         self.timeout_seconds = self._base_timeout
 
         # URL lists for different scan modes
@@ -225,7 +225,7 @@ class NucleiScanner(BaseScanner):
         )
 
         # Rate limiting — defaults adjusted if WAF detected
-        self._rate_limit = self.config.get("nuclei_rate_limit", 150)
+        self._rate_limit = self.config.get("nuclei_rate_limit", 10)
 
     def _find_nuclei(self) -> Optional[str]:
         """Find nuclei binary on PATH"""
@@ -502,7 +502,7 @@ class NucleiScanner(BaseScanner):
         self._waf_detected = waf_name
         if waf_name:
             # Reduce rates to stay under WAF bot-detection thresholds
-            self._rate_limit = min(self._rate_limit, 30)
+            self._rate_limit = min(self._rate_limit, 5)
             self.log(f"WAF detected ({waf_name}) — rate limit reduced to {self._rate_limit} rps")
 
     def set_origin_ip(self, ip: str, domain: str) -> None:
@@ -672,30 +672,27 @@ class NucleiScanner(BaseScanner):
 
         return list(set(workflows))
 
-    def _calculate_timeout(self, url_count: int, mode: str = "exploit") -> int:
+    def _calculate_timeout(self, url_count: int, mode: str = "exploit") -> Optional[int]:
         """Calculate wall-clock timeout based on URL count and mode.
 
-        Caps all modes at 3300s (55 min) to stay under the kill_chain's
-        3600s outer timeout with margin for cleanup.
+        Returns None when nuclei_timeout is not configured, meaning nuclei
+        runs until completion with no wall-clock kill.  Set nuclei_timeout
+        in config to impose a limit (e.g. nuclei_timeout: 7200 for 2h cap).
         """
-        MAX_TIMEOUT = 3300  # 55 minutes — under kill_chain's 3600s cap
+        if self._base_timeout is None:
+            return None  # unlimited — let nuclei finish naturally
 
         if mode == "recon":
-            # Recon uses lightweight info/low templates — fast per URL
             t = max(180, 120 + url_count * 3)
         elif mode == "network":
-            # Network probes are quick but need time for many services
             t = max(180, 180 + len(self._network_targets) * 5)
         elif mode == "headless":
-            # Headless spins up a browser per URL — needs real time
-            # Cap per-URL time at 15s to prevent runaway with large URL sets
             t = max(300, 120 + url_count * 15)
         else:
-            # Exploit: full template set per URL — proportional scaling
             extra = max(0, url_count - 50) * 2
             t = max(int(self._base_timeout), int(self._base_timeout + extra))
 
-        return min(t, MAX_TIMEOUT)
+        return t
 
     # =====================================================================
     # SCAN MODES
@@ -719,8 +716,9 @@ class NucleiScanner(BaseScanner):
 
         tags = self._build_recon_tags()
         exclude_tags = self._build_exclude_tags()
-        self.timeout_seconds = int(self._calculate_timeout(len(urls), mode="recon"))
-        self.log(f"[RECON] Scanning {len(urls)} URLs (timeout {self.timeout_seconds}s)")
+        self.timeout_seconds = self._calculate_timeout(len(urls), mode="recon")
+        limit_str = f"{self.timeout_seconds}s" if self.timeout_seconds is not None else "unlimited"
+        self.log(f"[RECON] Scanning {len(urls)} URLs (timeout {limit_str})")
 
         cmd_extra = ["-severity", "info,low"]
         if exclude_tags:
@@ -748,8 +746,9 @@ class NucleiScanner(BaseScanner):
         tags = self._build_exploit_tags()
         exclude_tags = self._build_exclude_tags()
 
-        self.timeout_seconds = int(self._calculate_timeout(len(urls), mode="exploit"))
-        self.log(f"[EXPLOIT] Scanning {len(urls)} URLs (timeout {self.timeout_seconds}s)")
+        self.timeout_seconds = self._calculate_timeout(len(urls), mode="exploit")
+        limit_str = f"{self.timeout_seconds}s" if self.timeout_seconds is not None else "unlimited"
+        self.log(f"[EXPLOIT] Scanning {len(urls)} URLs (timeout {limit_str})")
 
         cmd_extra = ["-severity", self._severity_filter]
         if exclude_tags:
@@ -782,7 +781,7 @@ class NucleiScanner(BaseScanner):
         if not self._network_targets:
             return
 
-        self.timeout_seconds = int(self._calculate_timeout(0, mode="network"))
+        self.timeout_seconds = self._calculate_timeout(0, mode="network")
         self.log(f"[NETWORK] Scanning {len(self._network_targets)} service targets")
 
         network_template_dir = self._template_dir / "network"
@@ -808,7 +807,7 @@ class NucleiScanner(BaseScanner):
 
         urls = list({context.url} | self._urls_to_scan)  # ALL URLs — DOM XSS hides in deep pages
 
-        self.timeout_seconds = int(self._calculate_timeout(len(urls), mode="headless"))
+        self.timeout_seconds = self._calculate_timeout(len(urls), mode="headless")
         self.log(f"[HEADLESS] Scanning {len(urls)} URLs with browser mode")
 
         # Check all template directories for headless templates
@@ -861,8 +860,9 @@ class NucleiScanner(BaseScanner):
         tags = self._build_exploit_tags()
         exclude_tags = self._build_exclude_tags()
 
-        self.timeout_seconds = int(self._calculate_timeout(len(urls)))
-        self.log(f"Running nuclei on {len(urls)} URLs (timeout {self.timeout_seconds}s)")
+        self.timeout_seconds = self._calculate_timeout(len(urls))
+        limit_str = f"{self.timeout_seconds}s" if self.timeout_seconds is not None else "unlimited"
+        self.log(f"Running nuclei on {len(urls)} URLs (timeout {limit_str})")
 
         cmd_extra = ["-severity", self._severity_filter]
         if exclude_tags:
@@ -1046,18 +1046,17 @@ class NucleiScanner(BaseScanner):
             # Stream stdout line by line (JSONL findings)
             try:
                 while True:
-                    # Overall wall-clock timeout
+                    # Overall wall-clock timeout (skipped when timeout_seconds is None)
                     elapsed = time.monotonic() - wall_start
-                    if elapsed >= self.timeout_seconds:
+                    if self.timeout_seconds is not None and elapsed >= self.timeout_seconds:
                         self.log(f"Nuclei wall-clock timeout after {int(elapsed)}s")
                         process.kill()
                         break
 
-                    remaining = self.timeout_seconds - elapsed
-                    # Short poll interval — we check the shared last_activity
-                    # timestamp after each timeout rather than blocking for the
-                    # full readline_timeout, so stderr activity is noticed quickly.
-                    poll_interval = min(10, remaining)
+                    poll_interval = 10  # seconds between stdout polls
+                    if self.timeout_seconds is not None:
+                        remaining = self.timeout_seconds - elapsed
+                        poll_interval = min(10, remaining)
 
                     try:
                         line = await asyncio.wait_for(
@@ -1070,7 +1069,8 @@ class NucleiScanner(BaseScanner):
                         idle_seconds = time.monotonic() - last_activity
                         actual_elapsed = time.monotonic() - wall_start
 
-                        if actual_elapsed >= self.timeout_seconds - 1:
+                        if (self.timeout_seconds is not None
+                                and actual_elapsed >= self.timeout_seconds - 1):
                             self.log(
                                 f"Nuclei timed out after {int(actual_elapsed)}s "
                                 f"(wall-clock limit {self.timeout_seconds}s)"
@@ -1187,7 +1187,7 @@ class NucleiScanner(BaseScanner):
 
             # Sanity check: flag impossibly fast completions
             url_count = len(effective_targets)
-            effective_rate = self._rate_limit or 150
+            effective_rate = self._rate_limit or 10
             # Minimum plausible time: at least 1 request per URL at the rate limit
             min_plausible_seconds = max(1, url_count // max(1, effective_rate))
             if (findings_count == 0 and total_elapsed < min_plausible_seconds
