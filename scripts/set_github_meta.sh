@@ -2,7 +2,7 @@
 # Set GitHub repo description and topics for SEO
 set -euo pipefail
 
-REPO="SudoPacman-Syuu/Beatrix"
+REPO="SudoPacman-Syuu/Beatrix-cli"
 
 echo "[1/3] Setting description..."
 gh api "repos/$REPO" -X PATCH \
@@ -40,7 +40,7 @@ EOF
 
 echo "[3/3] Setting homepage URL..."
 gh api "repos/$REPO" -X PATCH \
-  -f homepage="https://github.com/SudoPacman-Syuu/Beatrix#readme" \
+  -f homepage="https://github.com/SudoPacman-Syuu/Beatrix-cli#readme" \
   --silent
 
 echo ""

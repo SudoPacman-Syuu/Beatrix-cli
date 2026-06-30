@@ -4,10 +4,10 @@
 #  One-command installer for Linux systems
 #
 #  Usage:
-#    git clone https://github.com/SudoPacman-Syuu/Beatrix.git && cd Beatrix && ./install.sh
+#    git clone https://github.com/SudoPacman-Syuu/Beatrix-cli.git && cd Beatrix-cli && ./install.sh
 #
 #  Or:
-#    curl -sSL https://raw.githubusercontent.com/SudoPacman-Syuu/Beatrix/main/install.sh | bash
+#    curl -sSL https://raw.githubusercontent.com/SudoPacman-Syuu/Beatrix-cli/main/install.sh | bash
 #
 #  "Those of you lucky enough to have your lives, take them with you."
 # ═══════════════════════════════════════════════════════════════
@@ -986,7 +986,7 @@ main() {
     if [[ ! -f "pyproject.toml" ]]; then
         info "Cloning Beatrix CLI..."
         if command_exists git; then
-            git clone https://github.com/SudoPacman-Syuu/Beatrix.git /tmp/beatrix_cli_install
+            git clone https://github.com/SudoPacman-Syuu/Beatrix-cli.git /tmp/beatrix_cli_install
             cd /tmp/beatrix_cli_install
         else
             fail "git is required. Install it: ${DIM}sudo apt install git${RESET}"

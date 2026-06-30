@@ -2,6 +2,8 @@
 
 > *"Revenge is a dish best served with a working PoC."*
 
+![Python](https://img.shields.io/badge/Python-3.11%2B-blue?style=flat-square&logo=python) ![License](https://img.shields.io/badge/License-Source%20Available-lightgrey?style=flat-square) ![Platform](https://img.shields.io/badge/Platform-Linux-orange?style=flat-square&logo=linux) ![GitHub Stars](https://img.shields.io/github/stars/SudoPacman-Syuu/Beatrix-cli?style=flat-square)
+
 **License:** Source Available — Free for non-commercial use. Commercial use requires a separate license. See [LICENSE](LICENSE).
 
 A command-line bug bounty hunting framework. 32 scanner modules, 13 external tool integrations, full OWASP Top 10 coverage, a 7-phase Kill Chain methodology, and AI-assisted analysis. Targets can be domains, URLs, or raw IP addresses.
@@ -9,6 +11,64 @@ A command-line bug bounty hunting framework. 32 scanner modules, 13 external too
 ---
 
 <img src="beatrix.gif" width="1920" alt="Demo">
+
+---
+
+## Table of Contents
+
+- [Why Beatrix?](#why-beatrix)
+- [The Manual](#the-manual)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Command Reference](#command-reference)
+- [Requirements](#requirements)
+- [Presets](#presets)
+- [Verbosity](#verbosity)
+- [The Kill Chain](#the-kill-chain)
+- [Scanner Modules](#scanner-modules)
+- [External Tool Integrations](#external-tool-integrations)
+- [IP Address Targets](#ip-address-targets)
+- [Network Testing (Full Preset)](#network-testing-full-preset)
+- [Usage Examples](#usage-examples)
+- [Authenticated Scanning](#authenticated-scanning)
+- [GitHub Secret Scanning](#github-secret-scanning)
+- [Validation](#validation)
+- [Output Format](#output-format)
+- [Scan Output Directory](#scan-output-directory)
+- [Configuration](#configuration)
+- [Getting Help](#getting-help)
+- [Architecture](#architecture)
+- [Legal](#legal)
+
+---
+
+## Why Beatrix?
+
+Most bug bounty tools solve one problem. Beatrix solves the whole workflow.
+
+**Nuclei** is excellent at template-based scanning — known CVEs and patterns against a target. It doesn't crawl, doesn't manage auth sessions, doesn't chain tools together, and doesn't tell you what to do next. You still have to run subfinder, then amass, then nmap, then nuclei, then sqlmap, then dalfox, then manually correlate the output.
+
+**Burp Suite Pro** is the industry standard for manual web testing. It requires a GUI, costs $449/year, isn't scriptable, and doesn't run in headless environments like Codespaces or CI pipelines.
+
+Beatrix is the orchestration layer that was missing.
+
+| Feature | Beatrix | Nuclei | Burp Suite Pro |
+|---------|:-------:|:------:|:--------------:|
+| 7-phase Kill Chain methodology | ✅ | ❌ | ❌ |
+| Auto-login & session management | ✅ | ❌ | Manual |
+| Autonomous AI pentester (GHOST) | ✅ | ❌ | ❌ |
+| 13 external tool orchestration | ✅ | ❌ | ❌ |
+| Built-in OOB / PoC server | ✅ | ❌ | ✅ (Collaborator) |
+| Authenticated crawling | ✅ | ❌ | ✅ |
+| CLI / automation-friendly | ✅ | ✅ | ❌ |
+| Runs in headless environments | ✅ | ✅ | ❌ |
+| Cost | Free | Free | $449/yr |
+
+One command. Every phase. All the tools.
+
+```bash
+beatrix hunt example.com --preset full
+```
 
 ---
 
@@ -27,7 +87,7 @@ Opens in your default browser — no internet required. Also available at [`docs
 ## Installation
 
 ```bash
-git clone https://github.com/SudoPacman-Syuu/Beatrix.git && cd Beatrix && ./install.sh
+git clone https://github.com/SudoPacman-Syuu/Beatrix-cli.git && cd Beatrix-cli && ./install.sh
 ```
 
 The installer auto-detects your Python, selects the best install method, puts `beatrix` on your PATH, and installs all 21 external security tools (nuclei, nmap, sqlmap, subfinder, ffuf, and others).
