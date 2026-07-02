@@ -17,6 +17,15 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
 
+try:
+    from playwright.async_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
+except ImportError:
+    class PlaywrightError(Exception):
+        pass
+
+    class PlaywrightTimeoutError(Exception):
+        pass
+
 logger = logging.getLogger("beatrix.scanners.base")
 
 # ── User-Agent rotation pool ────────────────────────────────────────
@@ -181,6 +190,45 @@ class ScanContext:
         )
 
 
+class _HostRateRegistry:
+    """Process-wide, per-host rate ceiling shared across every scanner
+    instance (and nuclei's subprocess) that targets the same host.
+
+    A 429 flood is a property of the *target*, not of whichever scanner
+    instance happened to observe it first. Without this, each concurrently
+    running scanner (headers, cors, endpoint_prober, nuclei, ...) discovers
+    and backs off from the same WAF independently — so the aggregate
+    request rate against the host stays high even after every individual
+    scanner has "backed off" on paper. Sharing the ceiling means the first
+    scanner to get rate-limited slows everyone else down too.
+
+    Best-effort coordination signal, not a source of truth: reads/writes
+    are last-writer-wins with no locking, which is fine since it only ever
+    feeds an advisory ceiling that callers clamp their own rate to.
+    """
+
+    _rates: Dict[str, float] = {}
+
+    @classmethod
+    def get(cls, host: str) -> Optional[float]:
+        return cls._rates.get(host)
+
+    @classmethod
+    def update(cls, host: str, rate: float) -> None:
+        cls._rates[host] = rate
+
+
+def get_host_rate_ceiling(host: str, default: float) -> float:
+    """Current shared rate ceiling for `host`, or `default` if unset.
+
+    Lets components outside the scanner request path (e.g. the nuclei
+    subprocess wrapper, which can't route through BaseScanner.request())
+    pick up backoff decisions made by other scanners hitting the same host.
+    """
+    rate = _HostRateRegistry.get(host.lower())
+    return rate if rate is not None else default
+
+
 class _AdaptiveRateLimiter:
     """Token-bucket rate limiter that backs off only on HTTP 429s.
 
@@ -197,6 +245,12 @@ class _AdaptiveRateLimiter:
     Recovery: after _RECOVERY_S seconds without a 429 window trigger, rate
     is restored by 25% toward the original ceiling.  This prevents permanent
     rate degradation when a server was temporarily overloaded.
+
+    Backoff/recovery decisions are also mirrored into `_HostRateRegistry`
+    (keyed by the host passed to acquire()/record_429()) so concurrently
+    running scanner instances — and nuclei's subprocess, via
+    get_host_rate_ceiling() — converge on the same effective rate instead
+    of each independently rediscovering the same WAF.
     """
 
     _WINDOW_S: float = 60.0      # rolling window for 429 counting
@@ -214,9 +268,18 @@ class _AdaptiveRateLimiter:
         self._window_429: deque = deque()
         self._lock = asyncio.Lock()
 
-    async def acquire(self) -> None:
-        """Wait until a token is available at the current rate."""
+    async def acquire(self, host: str = "") -> None:
+        """Wait until a token is available at the current rate.
+
+        If another scanner instance has reported a lower ceiling for
+        `host`, adopt it immediately rather than waiting to observe our
+        own 3-429s-in-60s trigger.
+        """
         async with self._lock:
+            if host:
+                shared = _HostRateRegistry.get(host)
+                if shared is not None and shared < self._rate:
+                    self._rate = shared
             now = time.monotonic()
             elapsed = now - self._last_tick
             self._last_tick = now
@@ -232,8 +295,10 @@ class _AdaptiveRateLimiter:
                     and self._rate < self._ceiling):
                 self._rate = min(self._ceiling, self._rate * self._RECOVER_FACTOR)
                 self._last_recovery = now
+                if host:
+                    _HostRateRegistry.update(host, self._rate)
 
-    def record_429(self) -> None:
+    def record_429(self, host: str = "") -> None:
         """Signal that a 429 response was received — may trigger backoff."""
         now = time.monotonic()
         self._window_429.append(now)
@@ -250,6 +315,8 @@ class _AdaptiveRateLimiter:
                 self._rate = new_rate
                 self._last_recovery = now
                 self._window_429.clear()
+                if host:
+                    _HostRateRegistry.update(host, new_rate)
 
 
 class BaseScanner(ABC):
@@ -315,6 +382,12 @@ class BaseScanner(ABC):
         self._waf_success_strategy: Dict[str, int] = {}  # profile → last successful strategy #
         self._header_profile: dict[str, str] = random.choice(_HEADER_PROFILES)
 
+        # Browser-backed transport — set via enable_browser_transport() when
+        # the target fingerprints scripted HTTP clients (see auth_config.py
+        # SessionValidator.needs_browser_transport). When set, request()
+        # sends through a real Chromium network stack instead of httpx.
+        self._browser_client = None
+
     # Circuit breaker threshold — class-level constant
     _CB_THRESHOLD: int = 5
 
@@ -336,6 +409,31 @@ class BaseScanner(ABC):
         if self.client:
             await self.client.aclose()
             self.client = None
+        if self._browser_client:
+            await self._browser_client.close()
+            self._browser_client = None
+
+    async def enable_browser_transport(self) -> None:
+        """Route this scanner's requests through a real browser network
+        stack instead of httpx, for targets that fingerprint scripted HTTP
+        clients (e.g. Akamai bot management) and block/redirect them even
+        with valid session cookies. Called by the kill chain when
+        SessionValidator.needs_browser_transport is True.
+
+        Cookies aren't passed here — whatever `Cookie` header a request
+        already carries (from apply_auth(), or a scanner like IDOR passing
+        different per-account headers on different calls) is what actually
+        authenticates; BrowserRequestClient.request() syncs the browser's
+        cookie jar to match it before each request. This keeps browser
+        transport a transparent swap for scanners that already do their
+        own per-request header/cookie handling.
+        """
+        if self._browser_client is not None:
+            return  # already enabled
+        from beatrix.core.browser_transport import BrowserRequestClient
+
+        self._browser_client = BrowserRequestClient()
+        await self._browser_client.start()
 
     def apply_auth(self, auth_creds) -> None:
         """Inject authentication headers/cookies into the scanner's HTTP client.
@@ -453,7 +551,7 @@ class BaseScanner(ABC):
 
         # Enforce req/sec rate limit before acquiring concurrency slot.
         # _AdaptiveRateLimiter only backs off on 429 — never on 4xx/5xx payloads.
-        await self._rate_limiter.acquire()
+        await self._rate_limiter.acquire(host)
 
         rate_retries = 0
         waf_retries = 0
@@ -461,10 +559,24 @@ class BaseScanner(ABC):
             try:
                 async with _get_global_semaphore():
                     async with self.semaphore:
-                        response = await self.client.request(method, url, **kwargs)
+                        if self._browser_client is not None:
+                            # Same merge semantics as httpx: call-site headers
+                            # override the persistent client defaults. Any
+                            # Cookie header (from apply_auth(), or per-call
+                            # like IDOR's user1/user2 swap) is synced into the
+                            # browser's cookie jar inside BrowserRequestClient.
+                            merged_headers = dict(self.client.headers)
+                            merged_headers.update(kwargs.get("headers") or {})
+                            browser_kwargs = {k: v for k, v in kwargs.items() if k != "headers"}
+                            response = await self._browser_client.request(
+                                method, url, headers=merged_headers, **browser_kwargs
+                            )
+                        else:
+                            response = await self.client.request(method, url, **kwargs)
             except (httpx.ConnectError, httpx.ConnectTimeout,
                     httpx.ReadTimeout, httpx.WriteTimeout,
-                    httpx.PoolTimeout, httpx.RemoteProtocolError) as exc:
+                    httpx.PoolTimeout, httpx.RemoteProtocolError,
+                    PlaywrightError, PlaywrightTimeoutError) as exc:
                 # Transport-level failure — increment circuit breaker
                 count = self._cb_host_failures.get(host, 0) + 1
                 self._cb_host_failures[host] = count
@@ -493,7 +605,7 @@ class BaseScanner(ABC):
                 await asyncio.sleep(min(retry_after, 30))
                 rate_retries += 1
                 # Signal adaptive rate limiter — may halve req/sec if threshold hit
-                self._rate_limiter.record_429()
+                self._rate_limiter.record_429(host)
                 # Also engage per-request jitter delay
                 self._waf_throttle_delay = min(
                     self._waf_throttle_delay + 0.5, 3.0

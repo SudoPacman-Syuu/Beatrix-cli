@@ -733,21 +733,20 @@ class BusinessLogicScanner(BaseScanner):
 
     async def _test_race_conditions(self, context: ScanContext) -> AsyncIterator[Finding]:
         """
-        Test for race conditions (TOCTOU bugs).
+        Test for race conditions using last-byte synchronization and HTTP/2
+        single-packet attack.
 
-        Sends multiple identical requests simultaneously to detect if
-        the application properly handles concurrent access to shared state.
+        Last-byte sync: open N TCP connections, send all request bytes except
+        the final byte, then release all final bytes simultaneously via a
+        single asyncio event. This collapses the server-side processing window
+        to near-zero and triggers TOCTOU bugs that asyncio.gather() misses.
 
-        Common race condition targets:
-        - Coupon/discount redemption (redeem 1 code N times)
-        - Balance deductions (withdraw N * balance)
-        - Invite codes (use single-use code multiple times)
-        - Like/vote operations (vote multiple times)
-        - File uploads (overwrite race)
+        HTTP/2 single-packet: multiplex N requests into a single TCP frame with
+        the END_STREAM flag set, forcing the server to process them at once.
+        Falls back to last-byte sync over HTTP/1.1 when h2 is unavailable.
         """
-        self.log(f"Testing race conditions (BUSL-04) — {self.race_concurrency} concurrent requests")
+        self.log(f"Testing race conditions (BUSL-04) — last-byte sync, {self.race_concurrency} concurrent requests")
 
-        # Detect if this endpoint is a state-changing operation
         url_lower = context.url.lower()
         is_state_changing = any(p in url_lower for p in [
             'redeem', 'apply', 'coupon', 'discount', 'promo',
@@ -760,66 +759,302 @@ class BusinessLogicScanner(BaseScanner):
             self.log("  Skipping race condition test — endpoint doesn't appear state-changing")
             return
 
+        # Try HTTP/2 single-packet first, fall back to last-byte sync over HTTP/1.1
+        h2_available = False
         try:
-            # Send N concurrent requests
-            tasks = []
-            for _ in range(self.race_concurrency):
-                tasks.append(self.get(context.url, params=context.parameters))
+            import h2  # noqa: F401  (python-h2 package)
+            h2_available = True
+        except ImportError:
+            pass
 
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
+        if h2_available:
+            async for finding in self._race_http2_single_packet(context, is_state_changing):
+                yield finding
+        else:
+            async for finding in self._race_last_byte_sync(context, is_state_changing):
+                yield finding
 
-            # Analyze responses
-            successful = [r for r in responses if isinstance(r, httpx.Response) and r.status_code == 200]
-            errors = [r for r in responses if isinstance(r, Exception)]
+    async def _race_last_byte_sync(
+        self, context: ScanContext, is_state_changing: bool
+    ) -> AsyncIterator[Finding]:
+        """
+        Last-byte synchronization race condition test over HTTP/1.1.
 
-            statuses = [r.status_code for r in responses if isinstance(r, httpx.Response)]
-            unique_statuses = set(statuses)
+        1. Open N raw TCP connections (asyncio streams).
+        2. Send everything except the final byte of each request.
+        3. Release all final bytes simultaneously via asyncio.Event.
+        4. Read all responses and detect concurrent success.
+        """
+        import asyncio
+        import ssl
+        from urllib.parse import urlparse, urlencode
 
-            if len(successful) > 1 and is_state_changing:
-                # Multiple successful responses to a state-changing endpoint
-                # This MIGHT indicate a race condition
+        parsed = urlparse(context.url)
+        host = parsed.hostname or ""
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        use_tls = parsed.scheme == "https"
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        elif context.parameters and context.request.method == "GET":
+            path = f"{path}?{urlencode(context.parameters)}"
 
-                # Check if response bodies are identical or different
-                bodies = [r.text[:500] for r in successful]
-                unique_bodies = len(set(bodies))
+        method = context.request.method or "POST"
+        body = b""
+        if context.request.method == "POST" and context.parameters:
+            body = urlencode(context.parameters).encode()
 
-                yield self.create_finding(
-                    title=f"Potential Race Condition ({len(successful)}/{self.race_concurrency} succeeded)",
-                    severity=Severity.MEDIUM,
-                    confidence=Confidence.TENTATIVE,
-                    url=context.url,
-                    description=(
-                        f"**Race Condition Test Results:**\n\n"
-                        f"- Concurrent requests: {self.race_concurrency}\n"
-                        f"- Successful (HTTP 200): {len(successful)}\n"
-                        f"- Errors: {len(errors)}\n"
-                        f"- Unique status codes: {unique_statuses}\n"
-                        f"- Unique response bodies: {unique_bodies}\n\n"
-                        f"Multiple requests to this state-changing endpoint succeeded "
-                        f"simultaneously. If the endpoint performs a one-time operation "
-                        f"(e.g., redeem coupon, apply discount, transfer funds), processing "
-                        f"multiple instances is a **race condition vulnerability**.\n\n"
-                        f"**Manual verification required:** Check if the operation was "
-                        f"actually performed multiple times (e.g., check account balance, "
-                        f"coupon status, order count)."
-                    ),
-                    evidence=(
-                        f"{len(successful)} successful concurrent requests, "
-                        f"{unique_bodies} unique response bodies"
-                    ),
-                    remediation=(
-                        "1. Use database-level locking (SELECT FOR UPDATE)\n"
-                        "2. Implement idempotency keys for state-changing operations\n"
-                        "3. Use optimistic concurrency control (version stamps)\n"
-                        "4. Apply mutex/semaphore at the application level\n"
-                        "5. Use database transactions with appropriate isolation level"
-                    ),
-                    references=[
-                        "OWASP WSTG-BUSL-04",
-                        "CWE-362: Concurrent Execution using Shared Resource",
-                        "CWE-367: Time-of-check Time-of-use (TOCTOU) Race Condition",
-                    ],
-                )
+        # Build the full raw HTTP/1.1 request bytes
+        headers = [
+            f"Host: {host}",
+            "Content-Type: application/x-www-form-urlencoded",
+            f"Content-Length: {len(body)}",
+            "Connection: close",
+        ]
+        for k, v in (getattr(context.request, "headers", None) or {}).items():
+            if k.lower() not in ("host", "content-type", "content-length", "connection"):
+                headers.append(f"{k}: {v}")
+        request_head = (
+            f"{method} {path} HTTP/1.1\r\n"
+            + "\r\n".join(headers)
+            + "\r\n\r\n"
+        ).encode()
+        full_request = request_head + body
+
+        # Split: send everything except the very last byte
+        preamble = full_request[:-1]
+        final_byte = full_request[-1:]
+
+        n = self.race_concurrency
+        release_event = asyncio.Event()
+        responses_raw: List[Optional[bytes]] = [None] * n
+
+        async def _connect_and_hold(idx: int) -> None:
+            try:
+                if use_tls:
+                    ssl_ctx = ssl.create_default_context()
+                    ssl_ctx.check_hostname = False
+                    ssl_ctx.verify_mode = ssl.CERT_NONE
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(host, port, ssl=ssl_ctx), timeout=10
+                    )
+                else:
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(host, port), timeout=10
+                    )
+                writer.write(preamble)
+                await writer.drain()
+                # Hold until all connections are ready
+                await asyncio.wait_for(release_event.wait(), timeout=10)
+                writer.write(final_byte)
+                await writer.drain()
+                data = await asyncio.wait_for(reader.read(8192), timeout=10)
+                responses_raw[idx] = data
+                writer.close()
+            except Exception:
+                responses_raw[idx] = None
+
+        # Open all connections and prime them
+        tasks = [asyncio.create_task(_connect_and_hold(i)) for i in range(n)]
+        # Brief window for all connections to reach the hold point
+        await asyncio.sleep(0.05)
+        # Simultaneously release all final bytes
+        release_event.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        async for finding in self._analyze_race_responses(
+            context, responses_raw, n, is_state_changing, strategy="last-byte-sync"
+        ):
+            yield finding
+
+    async def _race_http2_single_packet(
+        self, context: ScanContext, is_state_changing: bool
+    ) -> AsyncIterator[Finding]:
+        """
+        HTTP/2 single-packet race condition attack.
+
+        Multiplexes N HEADERS+DATA frames into a single TCP write with
+        END_STREAM set on all of them. The server receives all request streams
+        simultaneously in one TCP segment, minimising jitter.
+
+        Falls back to last-byte sync on any h2 error.
+        """
+        import ssl
+        from urllib.parse import urlparse, urlencode
+
+        try:
+            import h2.config
+            import h2.connection
+            import h2.events
+        except ImportError:
+            async for f in self._race_last_byte_sync(context, is_state_changing):
+                yield f
+            return
+
+        parsed = urlparse(context.url)
+        host = parsed.hostname or ""
+        port = parsed.port or 443
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        elif context.parameters and context.request.method == "GET":
+            path = f"{path}?{urlencode(context.parameters)}"
+
+        method = context.request.method or "POST"
+        body = b""
+        if method == "POST" and context.parameters:
+            body = urlencode(context.parameters).encode()
+
+        n = self.race_concurrency
+        responses_raw: List[Optional[bytes]] = []
+
+        try:
+            ssl_ctx = ssl.create_default_context()
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+            ssl_ctx.set_alpn_protocols(["h2"])
+
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port, ssl=ssl_ctx), timeout=10
+            )
+
+            cfg = h2.config.H2Configuration(client_side=True, header_encoding="utf-8")
+            conn = h2.connection.H2Connection(config=cfg)
+            conn.initiate_connection()
+            writer.write(conn.data_to_send(65535))
+            await writer.drain()
+
+            # Build all HEADERS+DATA frames, accumulate in buffer, send as one write
+            base_headers = [
+                (":method", method),
+                (":path", path),
+                (":scheme", "https"),
+                (":authority", host),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ]
+            stream_ids = []
+            buf = b""
+            for i in range(n):
+                sid = conn.get_next_available_stream_id()
+                stream_ids.append(sid)
+                conn.send_headers(sid, base_headers, end_stream=(len(body) == 0))
+                if body:
+                    conn.send_data(sid, body, end_stream=True)
+                buf += conn.data_to_send(65535)
+
+            # Single TCP write — all streams arrive in one segment
+            writer.write(buf)
+            await writer.drain()
+
+            # Read responses for all streams
+            stream_responses: Dict[int, bytes] = {}
+            deadline = asyncio.get_event_loop().time() + 15
+            while len(stream_responses) < n and asyncio.get_event_loop().time() < deadline:
+                try:
+                    data = await asyncio.wait_for(reader.read(65535), timeout=5)
+                    if not data:
+                        break
+                    events = conn.receive_data(data)
+                    for ev in events:
+                        if isinstance(ev, h2.events.DataReceived):
+                            stream_responses.setdefault(ev.stream_id, b"")
+                            stream_responses[ev.stream_id] += ev.data
+                            conn.acknowledge_received_data(ev.flow_controlled_length, ev.stream_id)
+                        elif isinstance(ev, h2.events.StreamEnded):
+                            pass
+                    out = conn.data_to_send(65535)
+                    if out:
+                        writer.write(out)
+                        await writer.drain()
+                except asyncio.TimeoutError:
+                    break
+
+            writer.close()
+            for sid in stream_ids:
+                responses_raw.append(stream_responses.get(sid))
 
         except Exception as e:
-            self.log(f"  Race condition test error: {e}")
+            self.log(f"  HTTP/2 single-packet failed ({e}), falling back to last-byte sync")
+            async for f in self._race_last_byte_sync(context, is_state_changing):
+                yield f
+            return
+
+        async for finding in self._analyze_race_responses(
+            context, responses_raw, n, is_state_changing, strategy="h2-single-packet"
+        ):
+            yield finding
+
+    async def _analyze_race_responses(
+        self,
+        context: ScanContext,
+        responses_raw: List[Optional[bytes]],
+        n: int,
+        is_state_changing: bool,
+        strategy: str,
+    ) -> AsyncIterator[Finding]:
+        """Parse raw HTTP response bytes and emit findings on concurrent success."""
+        successful = []
+        errors = 0
+        status_counts: Dict[int, int] = {}
+
+        for raw in responses_raw:
+            if raw is None:
+                errors += 1
+                continue
+            try:
+                status_line = raw.split(b"\r\n", 1)[0].decode(errors="replace")
+                parts = status_line.split(" ", 2)
+                code = int(parts[1]) if len(parts) > 1 else 0
+                status_counts[code] = status_counts.get(code, 0) + 1
+                if 200 <= code < 300:
+                    # Grab body (after double CRLF)
+                    body = raw.split(b"\r\n\r\n", 1)[1][:500] if b"\r\n\r\n" in raw else b""
+                    successful.append((code, body.decode(errors="replace")))
+            except Exception:
+                errors += 1
+
+        self.log(
+            f"  Race ({strategy}): {len(successful)}/{n} successful, "
+            f"{errors} errors, statuses={status_counts}"
+        )
+
+        if len(successful) > 1 and is_state_changing:
+            unique_bodies = len({body for _, body in successful})
+            yield self.create_finding(
+                title=f"Race Condition ({len(successful)}/{n} concurrent succeeded) [{strategy}]",
+                severity=Severity.HIGH,
+                confidence=Confidence.TENTATIVE,
+                url=context.url,
+                description=(
+                    f"**Race Condition Test — {strategy}**\n\n"
+                    f"- Strategy: {strategy}\n"
+                    f"- Concurrent requests sent: {n}\n"
+                    f"- Successful (2xx): {len(successful)}\n"
+                    f"- Connection errors: {errors}\n"
+                    f"- Status distribution: {status_counts}\n"
+                    f"- Unique response bodies: {unique_bodies}\n\n"
+                    f"Multiple concurrent requests to this state-changing endpoint "
+                    f"all returned success. If this endpoint performs a one-time "
+                    f"operation (coupon redemption, fund transfer, invite claim), "
+                    f"this is a confirmed TOCTOU race condition.\n\n"
+                    f"**Manual verification required:** confirm the operation executed "
+                    f"more than once server-side (check balance, coupon status, order count)."
+                ),
+                evidence=(
+                    f"{len(successful)}/{n} concurrent 2xx responses via {strategy}; "
+                    f"{unique_bodies} unique body variants"
+                ),
+                remediation=(
+                    "1. Use database-level locking (SELECT FOR UPDATE / advisory locks)\n"
+                    "2. Issue idempotency keys and reject duplicate key reuse\n"
+                    "3. Optimistic concurrency control (version columns)\n"
+                    "4. Application-level mutex / Redis distributed lock\n"
+                    "5. Atomic compare-and-swap operations at the DB layer"
+                ),
+                references=[
+                    "OWASP WSTG-BUSL-04",
+                    "PortSwigger Research: HTTP/2 Single-Packet Attack",
+                    "CWE-362: Concurrent Execution using Shared Resource (TOCTOU)",
+                    "CWE-367: Time-of-check Time-of-use (TOCTOU) Race Condition",
+                ],
+            )

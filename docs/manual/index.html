@@ -535,7 +535,7 @@
     <div id="top" class="hero">
         <h1>BEATRIX</h1>
         <p>THE BLACK MAMBA OF BUG BOUNTY FRAMEWORKS</p>
-        <span class="version-badge">32 Modules · 13 Tool Integrations · 21 External Tools · Full OWASP Top 10</span>
+        <span class="version-badge">32 Modules · 22 Tool Integrations · 21 Auto-Installed Tools · Full OWASP Top 10</span>
     </div>
 
     <div class="container">
@@ -601,7 +601,7 @@
 
             <section id="intro">
                 <h2>1. Introduction</h2>
-                <p>Welcome to <strong>BEATRIX</strong>, a command-line bug bounty hunting framework designed for lethal efficiency. Named after the deadliest assassin, Beatrix brings 32 scanner modules, 13 external tool integrations, full OWASP Top 10 coverage, Kill Chain methodology, and AI-assisted analysis directly to your terminal. Targets can be domains, URLs, or raw IP addresses.</p>
+                <p>Welcome to <strong>BEATRIX</strong>, a command-line bug bounty hunting framework designed for lethal efficiency. Named after the deadliest assassin, Beatrix brings 32 scanner modules, 22 external tool integrations, full OWASP Top 10 coverage, Kill Chain methodology, and AI-assisted analysis directly to your terminal. Targets can be domains, URLs, or raw IP addresses.</p>
                 <p>Beatrix is built for operators who prefer a terminal over a GUI. It bridges the gap between high-level automation (for rapid, wide-scale sweeps) and low-level manual control (for surgical, targeted strikes).</p>
                 
                 <div class="warning">
@@ -655,6 +655,18 @@ make install-venv</code></pre>
                     <li><code>commix</code> (Python) - Used for command injection exploitation.</li>
                     <li><code>jwt_tool</code> (Python) - Used for JWT manipulation and testing.</li>
                     <li><code>metasploit</code> (Ruby) - Used for advanced exploitation and post-exploitation.</li>
+                </ul>
+
+                <h4>Optional Tools (auto-detected, not auto-installed)</h4>
+                <p>Beatrix integrates seven additional tools that unlock extra coverage. These are <strong>not</strong> installed by <code>./install.sh</code> or <code>beatrix setup</code> (which handle the 21 core tools above) &mdash; Beatrix auto-detects them on your <code>PATH</code> and runs them when present, degrading gracefully when they are absent. Install any you want yourself.</p>
+                <ul>
+                    <li><code>waymore</code> - Exhaustive historical URL mining (Wayback Machine, AlienVault OTX, URLScan.io, Common Crawl) beyond what <code>gau</code> covers.</li>
+                    <li><code>kiterunner</code> - API endpoint discovery via route-aware bruteforcing with real-world (assetnote) API route wordlists.</li>
+                    <li><code>arjun</code> - Hidden HTTP parameter discovery (undocumented GET/POST/JSON params).</li>
+                    <li><code>tlsx</code> - Fast TLS certificate inspection and cipher-suite enumeration.</li>
+                    <li><code>nomore403</code> - Systematic 403 bypass via header manipulation and path tricks.</li>
+                    <li><code>clairvoyance</code> - GraphQL schema reconstruction when introspection is disabled.</li>
+                    <li><code>crlfuzz</code> - Dedicated CRLF injection / HTTP response-splitting scanner.</li>
                 </ul>
 
                 <h3 id="config">Configuration</h3>
@@ -725,7 +737,11 @@ beatrix hunt target.com</code></pre>
                 </div>
 
                 <div class="pro-tip">
-                    <strong>Sessions:</strong> Authenticated sessions are saved to <code>~/.beatrix/sessions/</code> and reused for 24 hours. If the session contains a JWT, the token's <code>exp</code> claim is checked on every load — sessions expiring within 5 minutes are discarded automatically. Use <code>beatrix auth sessions</code> to list saved sessions, <code>--clear DOMAIN</code> to remove one, or <code>--clear-all</code> to wipe them. Use <code>--fresh-login</code> on a hunt to force re-authentication.
+                    <strong>Sessions:</strong> Authenticated sessions are saved to <code>~/.beatrix/sessions/</code> and reused for 24 hours. If the session contains a JWT, the token's <code>exp</code> claim is checked on every load — sessions expiring within 5 minutes are discarded automatically. Use <code>beatrix auth sessions</code> to list saved sessions, <code>--clear DOMAIN</code> to remove one, or <code>--clear-all</code> to wipe them. Use <code>--fresh-login</code> on a hunt to force re-authentication. During a scan, the <code>SessionValidator</code> periodically re-probes the target and re-authenticates if the session dies mid-hunt.
+                </div>
+
+                <div class="pro-tip">
+                    <strong>Bot-fingerprinting targets (<code>--browser-auth</code>):</strong> Some targets (e.g. Akamai bot management) fingerprint scripted HTTP clients and block a valid authenticated session regardless of correct cookies. Beatrix auto-detects this — when an <code>httpx</code> session probe fails but a real-Chromium probe succeeds, authenticated scanner requests are routed through a Playwright-backed transport that shares Chromium's real TLS/network fingerprint. The auto-detection samples a fixed list of auth-check paths and can miss path-specific blocking, so you can force it with <code>beatrix hunt example.com --browser-auth</code>. This is slower per request and only affects authenticated scanner traffic (not bulk unauthenticated requests); it requires Playwright (installed by <code>beatrix setup</code>).
                 </div>
 
                 <h4>Static Credentials (Manual)</h4>
@@ -798,6 +814,13 @@ beatrix hunt example.com
 beatrix strike https://api.example.com/v1/users -m idor</code></pre>
 
                 <div class="pro-tip">
+                    <strong>Shortcut — load IDOR accounts straight from HAR files (no credentials, no 2FA):</strong> instead of hand-editing <code>auth.yaml</code>, capture a HAR while logged in as each account and import one per slot with <code>--idor-slot</code>. Each import merges into <code>idor.&lt;slot&gt;</code> without clobbering the other slot, and because a HAR carries an already-authenticated session it sidesteps 2FA entirely:
+                    <pre><code>beatrix auth import example.com account1.har --idor-slot user1
+beatrix auth import example.com account2.har --idor-slot user2
+beatrix hunt example.com</code></pre>
+                </div>
+
+                <div class="pro-tip">
                     <strong>Tip:</strong> Use two accounts with <strong>different privilege levels</strong> (e.g., regular user vs. admin) for the most effective IDOR testing. The scanner will attempt to access user1's resources using user2's session — if it succeeds, that's a confirmed IDOR vulnerability. You can verify your IDOR credentials are loaded correctly with <code>beatrix auth show</code>.
                 </div>
 
@@ -833,7 +856,7 @@ beatrix strike https://api.example.com/v1/users -m idor</code></pre>
 ├── c2/                         # Phase 6: OOB callback results
 ├── actions/                    # Phase 7: VRT classification results
 └── findings/                   # Final aggregated findings JSON + summary</code></pre>
-                <p>All 13 external tool runners automatically capture raw stdout. Scanner results are saved as JSON after each module completes. Context snapshots (technologies, URLs, etc.) are saved after each kill chain phase. No extra flags needed &mdash; output is always saved automatically.</p>
+                <p>All 20 external tool runners automatically capture raw stdout. Scanner results are saved as JSON after each module completes. Context snapshots (technologies, URLs, etc.) are saved after each kill chain phase. No extra flags needed &mdash; output is always saved automatically.</p>
             </section>
 
             <section id="commands">
@@ -1615,7 +1638,7 @@ beatrix polyglot clobber</code></pre>
                 </table>
 
                 <h3>-vvv: External Tool Streaming</h3>
-                <p>At <code>-vvv</code>, Beatrix switches from buffered subprocess collection to async line-by-line streaming for all 13 external tool runners. Each line is prefixed with the tool name so output from concurrent tools is distinguishable. Tools that normally suppress output have their silence flags removed:</p>
+                <p>At <code>-vvv</code>, Beatrix switches from buffered subprocess collection to async line-by-line streaming for all 20 external tool runners. Each line is prefixed with the tool name so output from concurrent tools is distinguishable. Tools that normally suppress output have their silence flags removed:</p>
                 <ul>
                     <li><strong>amass</strong> — <code>-v</code> flag added; outputs each data source query and discovered subdomain as it happens rather than only at completion</li>
                     <li><strong>katana</strong> — <code>-silent -nc</code> removed; crawl progress and discovered URLs stream in real time</li>
@@ -1652,8 +1675,8 @@ beatrix hunt example.com --preset full -vvv -o results.json > scan.log</code></p
             </section>
 
             <section id="modules">
-                <h2>5. The Arsenal (32 Modules + 13 Tool Integrations)</h2>
-                <p>Beatrix packs 32 registered scanner modules plus 13 external tool integrations. You can view them in your terminal using <code>beatrix arsenal</code>. Here is the comprehensive breakdown of every capability.</p>
+                <h2>5. The Arsenal (32 Modules + 22 Tool Integrations)</h2>
+                <p>Beatrix packs 32 registered scanner modules plus 22 external tool integrations. You can view them in your terminal using <code>beatrix arsenal</code>. Here is the comprehensive breakdown of every capability.</p>
 
                 <h3 id="mod-recon">Phase 1: Reconnaissance</h3>
                 <p>The foundation of the framework. Without crawling and probing, scanners only see a bare URL with zero parameters, zero endpoints, and zero forms. This phase builds the <code>ScanContext</code> attack surface.</p>

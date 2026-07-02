@@ -203,7 +203,7 @@ class OriginIPDiscovery:
         result = OriginIPResult(domain=domain)
 
         # First, detect CDN
-        result.cdn_detected, result.cdn_ips = await self._detect_cdn(domain)
+        result.cdn_detected, result.cdn_ips = await self.detect_cdn(domain)
 
         # Run discovery techniques in parallel
         techniques = [
@@ -247,7 +247,7 @@ class OriginIPDiscovery:
         self.results.append(result)
         return result
 
-    async def _detect_cdn(self, domain: str) -> tuple:
+    async def detect_cdn(self, domain: str) -> tuple:
         """Detect if domain is behind a CDN/WAF"""
         cdn_detected = None
         cdn_ips = []
@@ -293,8 +293,13 @@ class OriginIPDiscovery:
                     if 'cf-ray' in headers or 'cf-cache-status' in headers:
                         return "Cloudflare"
 
-                    # Akamai
-                    if 'x-akamai' in str(headers).lower() or 'akamai' in headers.get('server', '').lower():
+                    # Akamai — header *names* commonly carry the signal
+                    # (Akamai-Request-BC, X-Akamai-Transformed, ...) without
+                    # a consistent prefix, and the Server header is usually
+                    # just the origin's own value (e.g. "nginx") since Akamai
+                    # passes it through. Search the full header blob, not
+                    # just Server, and don't require an "x-" prefix.
+                    if 'akamai' in str(headers).lower():
                         return "Akamai"
 
                     # Fastly

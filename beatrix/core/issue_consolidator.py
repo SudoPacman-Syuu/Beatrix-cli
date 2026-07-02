@@ -68,6 +68,17 @@ class IssueConsolidator:
         "header_injection",
     ])
 
+    # Host-scoped vuln types: a fact about the host/environment (WAF
+    # present, tech stack, etc), not a distinct per-path bug. Detection
+    # templates (e.g. nuclei's waf-detect) match identically on every URL
+    # they're pointed at — the per-request curl reproduce embedded in
+    # evidence differs each time even though the underlying signal is the
+    # same fact, so these need path AND evidence/description variance
+    # excluded from dedup entirely (see _fingerprint, _decide).
+    HOST_SCOPED_VULN_TYPES = frozenset([
+        "waf_detected",
+    ])
+
     def _fingerprint(self, f: Finding) -> str:
         """
         Generate a dedup fingerprint for a finding.
@@ -96,7 +107,10 @@ class IssueConsolidator:
         # param "q" across dozens of endpoints collapsed into one finding).
         # Cross-scanner dedup (injection vs smart_fuzzer, same URL) is still
         # handled by dropping the module from injection-class vulns.
-        if vuln_type in self.INJECTION_VULN_TYPES and param:
+        if vuln_type in self.HOST_SCOPED_VULN_TYPES:
+            # Same fact regardless of which path/param triggered it.
+            components = [host, vuln_type]
+        elif vuln_type in self.INJECTION_VULN_TYPES and param:
             components = [host, path, vuln_type, param]
         else:
             components = [host, path, vuln_type, param, module]
@@ -149,6 +163,7 @@ class IssueConsolidator:
             (r"websocket|web\s*socket", "websocket"),
             (r"takeover|subdomain\s*takeover", "takeover"),
             (r"graphql", "graphql"),
+            (r"\bwaf\s*detect", "waf_detected"),
         ]
 
         import re
@@ -233,13 +248,19 @@ class IssueConsolidator:
 
         # Same severity: check if evidence differs significantly
         if new_score == existing_score:
+            host_scoped = self._normalize_title(new.title) in self.HOST_SCOPED_VULN_TYPES
+
             # F-07: Different payloads on the same vuln type + param are
             # redundant — the first confirmed payload is sufficient.
             # Only genuinely different evidence (e.g. different secrets,
             # different endpoints) warrants keeping both.
-
-            # Different evidence values = distinct findings (e.g. different secrets)
-            if new.evidence and existing.evidence:
+            #
+            # Skipped for host-scoped types: their evidence embeds a
+            # per-request curl reproduce command whose URL differs on every
+            # match even though the underlying fact (e.g. "WAF present")
+            # is identical — comparing it verbatim would defeat dedup for
+            # exactly the findings this category exists to collapse.
+            if not host_scoped and new.evidence and existing.evidence:
                 new_ev = str(sorted(new.evidence.items())) if isinstance(new.evidence, dict) else str(new.evidence)
                 old_ev = str(sorted(existing.evidence.items())) if isinstance(existing.evidence, dict) else str(existing.evidence)
                 if new_ev != old_ev:
@@ -250,7 +271,7 @@ class IssueConsolidator:
             # Without normalization, the same finding from two runs —
             # or two requests to the same endpoint — always differs and
             # defeats dedup.
-            if (new.description and existing.description and
+            if (not host_scoped and new.description and existing.description and
                     len(new.description) > 20):
                 norm_new = self._normalize_description(new.description)
                 norm_old = self._normalize_description(existing.description)

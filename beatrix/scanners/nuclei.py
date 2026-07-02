@@ -31,13 +31,14 @@ import json
 import os
 import re
 import shutil
+import signal
 import time
 from pathlib import Path
 from typing import AsyncIterator, Dict, List, Optional, Set
 
 from beatrix.core.types import Confidence, Finding, Severity
 
-from .base import BaseScanner, ScanContext
+from .base import BaseScanner, ScanContext, get_host_rate_ceiling
 
 # Map nuclei severity strings to Beatrix Severity
 NUCLEI_SEVERITY_MAP = {
@@ -625,6 +626,32 @@ class NucleiScanner(BaseScanner):
         "intrusive",    # Destructive operations (DELETE, DROP, etc.)
     }
 
+    # Param names that carry high injection/redirect/IDOR risk.
+    # URLs with these params are kept preferentially when deduplicating.
+    _HIGH_RISK_PARAMS: Set[str] = {
+        # Redirect / SSRF
+        "url", "redirect_url", "redirect", "r", "next", "return", "return_url",
+        "dest", "destination", "target", "goto", "callback", "continue",
+        # File / path traversal
+        "file", "path", "filepath", "dir", "folder", "page", "template", "include",
+        # Command / eval
+        "cmd", "exec", "command", "run", "eval",
+        # IDOR
+        "id", "user_id", "uid", "account_id", "order_id", "item_id", "pid",
+        # Auth / token
+        "token", "key", "api_key", "secret", "access_token", "auth",
+        # Reference
+        "src", "source", "ref", "referrer", "origin",
+        # Search / query (SQLi surface)
+        "q", "query", "search", "keyword", "term",
+    }
+
+    # Extensions that attract specific CVE/tech templates.
+    _INTERESTING_EXTENSIONS: Set[str] = {
+        ".php", ".aspx", ".asp", ".jsp", ".jspx", ".cfm", ".cgi", ".pl",
+        ".do", ".action", ".axd", ".ashx", ".asmx", ".svc",
+    }
+
     def _build_exclude_tags(self) -> str:
         """Build exclude tags: always-dangerous + technologies NOT detected.
 
@@ -672,6 +699,133 @@ class NucleiScanner(BaseScanner):
 
         return list(set(workflows))
 
+    def _sample_urls(self, urls: List[str], mode: str = "exploit") -> List[str]:
+        """Deduplicate and prioritize URLs before handing them to nuclei.
+
+        Three layers applied in order:
+
+        1. Path-signature dedup — numeric IDs, UUIDs, and long hashes in path
+           segments are normalized to placeholders, then only one representative
+           URL is kept per (host, normalized-path) pair.  This collapses e.g.
+           100 × /help/article/{id} URLs down to a single representative.
+
+        2. Param-name dedup — query strings are reduced to the frozenset of
+           their param *names*.  Multiple URLs that hit the same endpoint with
+           the same parameter names but different values are collapsed to one.
+
+        3. Priority scoring — within each group the highest-priority URL wins:
+           high-risk param names (SSRF/redirect/IDOR surfaces), interesting
+           file extensions (.php/.aspx/…), and API/admin path prefixes are
+           all boosted.  The seed URL (context root) always scores highest.
+
+        mode="recon"    — path-sig dedup only; param values don't matter for
+                          panel/tech detection templates.
+        mode="exploit"  — full three-layer dedup; keeps one URL per unique
+                          (host, path-pattern, param-name-set).
+        mode="headless" — most aggressive; path-sig only, browser rendering
+                          cost makes per-value variation wasteful.
+        """
+        from urllib.parse import urlparse, parse_qs
+        import re
+
+        if not urls:
+            return []
+
+        def _path_sig(path: str) -> str:
+            p = re.sub(
+                r'/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+                '/{uuid}', path, flags=re.IGNORECASE,
+            )
+            p = re.sub(r'/[0-9a-f]{32,}', '/{hash}', p, flags=re.IGNORECASE)
+            p = re.sub(r'/\d+', '/{id}', p)
+            # Collapse content slugs (blog posts, press releases, news articles).
+            # Signal: 4+ hyphen-separated words in a single path segment.
+            # This catches e.g. /airbnb-2026-summer-release/ but leaves
+            # /become-a-host (3 parts) and /about-us (2 parts) alone.
+            p = re.sub(r'/[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+){3,}', '/{slug}', p)
+            return p
+
+        def _param_sig(query: str) -> frozenset:
+            if not query:
+                return frozenset()
+            # Normalize HTML-entity-encoded amp; prefixes that crawlers emit
+            names = parse_qs(query.replace("amp;", ""), keep_blank_values=True).keys()
+            return frozenset(names)
+
+        def _score(url: str, parsed, param_names: frozenset) -> int:
+            """Lower score = higher priority (kept over lower-priority peers)."""
+            score = 0
+            path = parsed.path
+
+            # Shallow paths first (root and depth-1 get big boost)
+            depth = path.rstrip("/").count("/")
+            score += depth * 8
+
+            # High-risk params are prime injection surfaces
+            if param_names & self._HIGH_RISK_PARAMS:
+                score -= 100
+
+            # Tech-specific extensions attract CVE templates
+            suffix = path.rsplit(".", 1)[-1].lower() if "." in path.split("/")[-1] else ""
+            if f".{suffix}" in self._INTERESTING_EXTENSIONS:
+                score -= 60
+
+            # API / admin / panel paths
+            path_lower = path.lower()
+            if any(seg in path_lower for seg in (
+                "/api/", "/admin", "/dashboard", "/panel",
+                "/_/", "/graphql", "/v1/", "/v2/", "/v3/",
+                "/swagger", "/actuator", "/debug",
+            )):
+                score -= 80
+
+            return score
+
+        # Parse all URLs, compute signatures and scores
+        candidates = []
+        for url in urls:
+            try:
+                parsed = urlparse(url)
+                if not parsed.netloc:
+                    continue
+                psig = _path_sig(parsed.path)
+                qsig = _param_sig(parsed.query) if parsed.query else frozenset()
+                pnames = frozenset(
+                    parse_qs(parsed.query.replace("amp;", ""), keep_blank_values=True).keys()
+                ) if parsed.query else frozenset()
+                score = _score(url, parsed, pnames)
+                candidates.append((score, url, parsed.netloc, psig, qsig))
+            except Exception:
+                continue
+
+        # Sort by score so the best representative wins each group
+        candidates.sort(key=lambda x: x[0])
+
+        seen: Set[tuple] = set()
+        result: List[str] = []
+
+        for score, url, netloc, psig, qsig in candidates:
+            if mode in ("recon", "headless"):
+                # Path-sig only — ignore param variation
+                key = (netloc, psig)
+            else:
+                # Full dedup: path + param-name set
+                key = (netloc, psig, qsig)
+
+            if key not in seen:
+                seen.add(key)
+                result.append(url)
+
+        orig = len(urls)
+        sampled = len(result)
+        if sampled < orig:
+            self.log(
+                f"[sample] {orig} → {sampled} URLs after dedup "
+                f"(saved {orig - sampled} redundant targets, mode={mode})"
+            )
+
+        return result
+
     def _calculate_timeout(self, url_count: int, mode: str = "exploit") -> Optional[int]:
         """Calculate wall-clock timeout based on URL count and mode.
 
@@ -712,19 +866,20 @@ class NucleiScanner(BaseScanner):
 
         urls = set()
         urls.add(context.url)
-        urls.update(self._urls_to_scan)  # ALL URLs — effectiveness over speed
+        urls.update(self._urls_to_scan)
+        sampled = self._sample_urls(list(urls), mode="recon")
 
         tags = self._build_recon_tags()
         exclude_tags = self._build_exclude_tags()
-        self.timeout_seconds = self._calculate_timeout(len(urls), mode="recon")
+        self.timeout_seconds = self._calculate_timeout(len(sampled), mode="recon")
         limit_str = f"{self.timeout_seconds}s" if self.timeout_seconds is not None else "unlimited"
-        self.log(f"[RECON] Scanning {len(urls)} URLs (timeout {limit_str})")
+        self.log(f"[RECON] Scanning {len(sampled)} URLs (timeout {limit_str})")
 
         cmd_extra = ["-severity", "info,low"]
         if exclude_tags:
             cmd_extra.extend(["-exclude-tags", exclude_tags])
 
-        async for finding in self._run_nuclei(list(urls), tags, cmd_extra=cmd_extra):
+        async for finding in self._run_nuclei(sampled, tags, cmd_extra=cmd_extra):
             yield finding
 
     async def scan_exploit(self, context: ScanContext) -> AsyncIterator[Finding]:
@@ -742,13 +897,14 @@ class NucleiScanner(BaseScanner):
         urls = set()
         urls.add(context.url)
         urls.update(self._urls_to_scan)
+        sampled = self._sample_urls(list(urls), mode="exploit")
 
         tags = self._build_exploit_tags()
         exclude_tags = self._build_exclude_tags()
 
-        self.timeout_seconds = self._calculate_timeout(len(urls), mode="exploit")
+        self.timeout_seconds = self._calculate_timeout(len(sampled), mode="exploit")
         limit_str = f"{self.timeout_seconds}s" if self.timeout_seconds is not None else "unlimited"
-        self.log(f"[EXPLOIT] Scanning {len(urls)} URLs (timeout {limit_str})")
+        self.log(f"[EXPLOIT] Scanning {len(sampled)} URLs (timeout {limit_str})")
 
         cmd_extra = ["-severity", self._severity_filter]
         if exclude_tags:
@@ -756,7 +912,7 @@ class NucleiScanner(BaseScanner):
             self.log(f"Excluding tags: {exclude_tags}")
 
         # Main tag-based scan
-        async for finding in self._run_nuclei(list(urls), tags, cmd_extra=cmd_extra):
+        async for finding in self._run_nuclei(sampled, tags, cmd_extra=cmd_extra):
             yield finding
 
         # Workflow scan — technology-specific multi-step attack chains
@@ -765,7 +921,7 @@ class NucleiScanner(BaseScanner):
             self.log(f"Running {len(workflows)} workflows: {', '.join(Path(w).stem for w in workflows)}")
             for wf in workflows:
                 async for finding in self._run_nuclei(
-                    list(urls), tags="", cmd_extra=["-w", wf, "-severity", self._severity_filter]
+                    sampled, tags="", cmd_extra=["-w", wf, "-severity", self._severity_filter]
                 ):
                     yield finding
 
@@ -805,7 +961,8 @@ class NucleiScanner(BaseScanner):
         if not self.nuclei_path or not await self._ensure_templates():
             return
 
-        urls = list({context.url} | self._urls_to_scan)  # ALL URLs — DOM XSS hides in deep pages
+        raw_urls = list({context.url} | self._urls_to_scan)
+        urls = self._sample_urls(raw_urls, mode="headless")
 
         self.timeout_seconds = self._calculate_timeout(len(urls), mode="headless")
         self.log(f"[HEADLESS] Scanning {len(urls)} URLs with browser mode")
@@ -934,190 +1091,298 @@ class NucleiScanner(BaseScanner):
             target_file = f.name
 
         try:
-            cmd = [
-                self.nuclei_path,
-                "-l", target_file,
-                "-jsonl",
-                "-silent",
-                "-no-color",
-                "-timeout", "30",
-                "-retries", "2",
-                "-rate-limit", str(self._rate_limit),
-                "-bulk-size", "50",
-                "-concurrency", "25",
-                "-stats",
-                "-stats-interval", "15",
-            ]
+            # Resolve the target host once so we can consult/report the
+            # shared cross-scanner rate ceiling (see base.py
+            # _HostRateRegistry). nuclei has no live rate-adjustment API —
+            # its -rate-limit is fixed at spawn — so reacting to a 429
+            # flood means interrupting it (SIGINT triggers its own resume
+            # checkpoint) and relaunching with a lower rate via -resume.
+            watch_host: Optional[str] = None
+            try:
+                from urllib.parse import urlparse as _nuclei_urlparse
+                watch_host = _nuclei_urlparse(effective_targets[0]).hostname
+            except Exception:
+                pass
 
-            # Tags (skip if using -w workflow or -t specific dir)
-            if tags:
-                cmd.extend(["-tags", tags])
+            current_rate = self._rate_limit
+            if watch_host:
+                shared_rate = get_host_rate_ceiling(watch_host, self._rate_limit)
+                if shared_rate < current_rate:
+                    current_rate = max(1, int(shared_rate))
+                    self.log(
+                        f"[nuclei] Adopting shared host rate ceiling "
+                        f"{current_rate} rps (below configured {self._rate_limit}) "
+                        f"— another scanner already saw 429s on {watch_host}"
+                    )
 
-            # Realistic User-Agent — prevents WAF fingerprinting nuclei's
-            # default UA ("Nuclei - Open-source project (projectdiscovery.io)")
-            cmd.extend(["-H", f"User-Agent: {self._user_agent}"])
-
-            # Origin IP bypass — we've added origin-targeted URLs alongside
-            # normal ones. We do NOT set a global Host header because that
-            # would override the Host for CDN-routed URLs too.  Origin URLs
-            # (http://<ip>/path) will send Host: <ip> — many origin servers
-            # accept this for default-vhost routing.  For strict vhosts, a
-            # separate origin-only scan with explicit Host would be needed.
-            if origin_targets_added:
-                # TLS SNI helps the origin serve the right cert when accessed
-                # via HTTPS.  safe to set globally — CDN URLs already match.
-                cmd.extend(["-sni", self._target_domain])
-                # Don't skip the host after cert/connection errors — origin IPs
-                # may have transient issues but are still worth scanning
-                cmd.extend(["-no-mhe"])
-
-            # Authentication headers
-            if self._auth_headers:
-                cmd.extend(self._auth_headers)
-
-            # Interactsh configuration
-            if self._interactsh_server:
-                cmd.extend(["-iserver", self._interactsh_server])
-                if self._interactsh_token:
-                    cmd.extend(["-itoken", self._interactsh_token])
-
-            # Custom template directories
-            if self._custom_template_dir.exists() and self._dir_has_yaml(self._custom_template_dir):
-                cmd.extend(["-t", str(self._custom_template_dir)])
-
-            # External template directories (already verified during _ensure_templates)
-            for ext_dir in self._extra_template_dirs:
-                cmd.extend(["-t", str(ext_dir)])
-
-            # Extra flags (severity, exclude-tags, -w, -headless, etc.)
-            if cmd_extra:
-                cmd.extend(cmd_extra)
-
-            self.log(f"Executing: {' '.join(cmd[:5])}...")
-
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,   # Capture stderr for progress/errors
-                limit=1024 * 1024,  # 1MB line buffer (nuclei can output long lines)
-            )
+            resume_file = target_file + ".resume"
+            max_attempts = 3
+            rate_drop_restarts = 0
 
             findings_count = 0
             wall_start = time.monotonic()
+            stderr_lines: List[str] = []  # merged across all attempts
+            process = None
 
-            # Shared activity tracker: both stdout and stderr reset this
-            # timestamp.  The idle timeout checks this instead of relying
-            # solely on stdout — nuclei writes template-compilation progress
-            # to stderr before producing any stdout, and we must not kill the
-            # process during that phase.
-            last_activity = time.monotonic()
-            readline_timeout = 120
+            for attempt in range(1, max_attempts + 1):
+                cmd = [
+                    self.nuclei_path,
+                    "-l", target_file,
+                    "-jsonl",
+                    "-silent",
+                    "-no-color",
+                    "-timeout", "30",
+                    "-retries", "2",
+                    "-rate-limit", str(current_rate),
+                    "-bulk-size", "50",
+                    "-concurrency", "25",
+                    "-stats",
+                    "-stats-interval", "15",
+                    "-resume", resume_file,
+                ]
 
-            # Background task to drain stderr and log progress
-            stderr_lines: List[str] = []
+                # Tags (skip if using -w workflow or -t specific dir)
+                if tags:
+                    cmd.extend(["-tags", tags])
 
-            async def _drain_stderr():
-                """Read stderr in background so the pipe doesn't block."""
-                nonlocal last_activity
+                # Realistic User-Agent — prevents WAF fingerprinting nuclei's
+                # default UA ("Nuclei - Open-source project (projectdiscovery.io)")
+                cmd.extend(["-H", f"User-Agent: {self._user_agent}"])
+
+                # Origin IP bypass — we've added origin-targeted URLs alongside
+                # normal ones. We do NOT set a global Host header because that
+                # would override the Host for CDN-routed URLs too.  Origin URLs
+                # (http://<ip>/path) will send Host: <ip> — many origin servers
+                # accept this for default-vhost routing.  For strict vhosts, a
+                # separate origin-only scan with explicit Host would be needed.
+                if origin_targets_added:
+                    # TLS SNI helps the origin serve the right cert when accessed
+                    # via HTTPS.  safe to set globally — CDN URLs already match.
+                    cmd.extend(["-sni", self._target_domain])
+                    # Don't skip the host after cert/connection errors — origin IPs
+                    # may have transient issues but are still worth scanning
+                    cmd.extend(["-no-mhe"])
+
+                # Authentication headers
+                if self._auth_headers:
+                    cmd.extend(self._auth_headers)
+
+                # Interactsh configuration
+                if self._interactsh_server:
+                    cmd.extend(["-iserver", self._interactsh_server])
+                    if self._interactsh_token:
+                        cmd.extend(["-itoken", self._interactsh_token])
+
+                # Custom template directories
+                if self._custom_template_dir.exists() and self._dir_has_yaml(self._custom_template_dir):
+                    cmd.extend(["-t", str(self._custom_template_dir)])
+
+                # External template directories (already verified during _ensure_templates)
+                for ext_dir in self._extra_template_dirs:
+                    cmd.extend(["-t", str(ext_dir)])
+
+                # Extra flags (severity, exclude-tags, -w, -headless, etc.)
+                if cmd_extra:
+                    cmd.extend(cmd_extra)
+
+                if attempt == 1:
+                    self.log(f"Executing: {' '.join(cmd[:5])}...")
+                else:
+                    self.log(
+                        f"[nuclei] Resuming interrupted scan at {current_rate} rps "
+                        f"(attempt {attempt}/{max_attempts})"
+                    )
+
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,   # Capture stderr for progress/errors
+                    limit=1024 * 1024,  # 1MB line buffer (nuclei can output long lines)
+                )
+
+                # Shared activity tracker: both stdout and stderr reset this
+                # timestamp.  The idle timeout checks this instead of relying
+                # solely on stdout — nuclei writes template-compilation progress
+                # to stderr before producing any stdout, and we must not kill the
+                # process during that phase.
+                last_activity = time.monotonic()
+                readline_timeout = 120
+
+                # Background task to drain stderr and log progress
+                attempt_stderr_lines: List[str] = []
+
+                async def _drain_stderr():
+                    """Read stderr in background so the pipe doesn't block."""
+                    nonlocal last_activity
+                    try:
+                        while True:
+                            raw = await process.stderr.readline()
+                            if not raw:
+                                break
+                            last_activity = time.monotonic()  # stderr counts as activity
+                            text = raw.decode("utf-8", errors="replace").strip()
+                            if text:
+                                attempt_stderr_lines.append(text)
+                                # Immediately log fatal/critical errors
+                                text_lower = text.lower()
+                                if any(kw in text_lower for kw in
+                                       ("[ftl]", "[fat]", "fatal", "panic")):
+                                    self.log(f"[nuclei] FATAL: {text}")
+                                # Log stats/progress lines so the user sees activity
+                                elif any(kw in text_lower for kw in
+                                       ("templates", "hosts", "requests", "errors",
+                                        "matched", "duration", "rps")):
+                                    self.log(f"[nuclei] {text}")
+                    except Exception:
+                        pass
+
+                # Background task to watch for a shared-host rate drop while
+                # this attempt is running. A drop means another scanner (or
+                # a previous nuclei attempt) hit a 429 burst on this exact
+                # host — no point grinding the rest of this attempt out at
+                # a rate we already know is too hot.
+                rate_dropped = False
+
+                async def _watch_host_rate():
+                    nonlocal rate_dropped
+                    if not watch_host:
+                        return
+                    try:
+                        while True:
+                            await asyncio.sleep(15)
+                            shared = get_host_rate_ceiling(watch_host, current_rate)
+                            if shared < current_rate * 0.9:
+                                rate_dropped = True
+                                return
+                    except asyncio.CancelledError:
+                        pass
+
+                stderr_task = asyncio.create_task(_drain_stderr())
+                watch_task = asyncio.create_task(_watch_host_rate()) if watch_host else None
+
+                interrupted_for_restart = False
+
+                # Stream stdout line by line (JSONL findings)
                 try:
                     while True:
-                        raw = await process.stderr.readline()
-                        if not raw:
-                            break
-                        last_activity = time.monotonic()  # stderr counts as activity
-                        text = raw.decode("utf-8", errors="replace").strip()
-                        if text:
-                            stderr_lines.append(text)
-                            # Immediately log fatal/critical errors
-                            text_lower = text.lower()
-                            if any(kw in text_lower for kw in
-                                   ("[ftl]", "[fat]", "fatal", "panic")):
-                                self.log(f"[nuclei] FATAL: {text}")
-                            # Log stats/progress lines so the user sees activity
-                            elif any(kw in text_lower for kw in
-                                   ("templates", "hosts", "requests", "errors",
-                                    "matched", "duration", "rps")):
-                                self.log(f"[nuclei] {text}")
-                except Exception:
-                    pass
-
-            stderr_task = asyncio.create_task(_drain_stderr())
-
-            # Stream stdout line by line (JSONL findings)
-            try:
-                while True:
-                    # Overall wall-clock timeout (skipped when timeout_seconds is None)
-                    elapsed = time.monotonic() - wall_start
-                    if self.timeout_seconds is not None and elapsed >= self.timeout_seconds:
-                        self.log(f"Nuclei wall-clock timeout after {int(elapsed)}s")
-                        process.kill()
-                        break
-
-                    poll_interval = 10  # seconds between stdout polls
-                    if self.timeout_seconds is not None:
-                        remaining = self.timeout_seconds - elapsed
-                        poll_interval = min(10, remaining)
-
-                    try:
-                        line = await asyncio.wait_for(
-                            process.stdout.readline(),
-                            timeout=poll_interval
-                        )
-                    except asyncio.TimeoutError:
-                        # No stdout line within poll_interval — check if there
-                        # has been ANY activity (stdout or stderr) recently.
-                        idle_seconds = time.monotonic() - last_activity
-                        actual_elapsed = time.monotonic() - wall_start
-
-                        if (self.timeout_seconds is not None
-                                and actual_elapsed >= self.timeout_seconds - 1):
-                            self.log(
-                                f"Nuclei timed out after {int(actual_elapsed)}s "
-                                f"(wall-clock limit {self.timeout_seconds}s)"
-                            )
+                        # Overall wall-clock timeout (skipped when timeout_seconds is None)
+                        elapsed = time.monotonic() - wall_start
+                        if self.timeout_seconds is not None and elapsed >= self.timeout_seconds:
+                            self.log(f"Nuclei wall-clock timeout after {int(elapsed)}s")
                             process.kill()
                             break
-                        elif idle_seconds >= readline_timeout:
-                            # No stdout AND no stderr for readline_timeout seconds
+
+                        if rate_dropped and attempt < max_attempts:
                             self.log(
-                                f"Nuclei no output (stdout+stderr) for {readline_timeout}s — "
-                                f"assuming complete ({int(actual_elapsed)}s elapsed)"
+                                f"[nuclei] Shared rate ceiling for {watch_host} dropped "
+                                f"below {current_rate} rps mid-scan — interrupting to "
+                                f"resume at a lower rate instead of continuing to eat 429s"
                             )
-                            process.kill()
+                            interrupted_for_restart = True
+                            try:
+                                process.send_signal(signal.SIGINT)
+                            except ProcessLookupError:
+                                pass
                             break
-                        else:
-                            # stderr is still active (template compilation, stats, etc.) — keep waiting
+
+                        poll_interval = 5 if watch_host else 10  # tighter poll so a rate drop is noticed promptly
+                        if self.timeout_seconds is not None:
+                            remaining = self.timeout_seconds - elapsed
+                            poll_interval = min(poll_interval, remaining)
+                        poll_interval = max(0.1, poll_interval)
+
+                        try:
+                            line = await asyncio.wait_for(
+                                process.stdout.readline(),
+                                timeout=poll_interval
+                            )
+                        except asyncio.TimeoutError:
+                            # No stdout line within poll_interval — check if there
+                            # has been ANY activity (stdout or stderr) recently.
+                            idle_seconds = time.monotonic() - last_activity
+                            actual_elapsed = time.monotonic() - wall_start
+
+                            if (self.timeout_seconds is not None
+                                    and actual_elapsed >= self.timeout_seconds - 1):
+                                self.log(
+                                    f"Nuclei timed out after {int(actual_elapsed)}s "
+                                    f"(wall-clock limit {self.timeout_seconds}s)"
+                                )
+                                process.kill()
+                                break
+                            elif idle_seconds >= readline_timeout:
+                                # No stdout AND no stderr for readline_timeout seconds
+                                self.log(
+                                    f"Nuclei no output (stdout+stderr) for {readline_timeout}s — "
+                                    f"assuming complete ({int(actual_elapsed)}s elapsed)"
+                                )
+                                process.kill()
+                                break
+                            else:
+                                # stderr is still active (template compilation, stats, etc.) — keep waiting
+                                continue
+
+                        if not line:
+                            # EOF — nuclei exited normally
+                            break
+
+                        last_activity = time.monotonic()  # stdout line received
+                        decoded = line.decode('utf-8', errors='replace').strip()
+                        if not decoded:
                             continue
 
-                    if not line:
-                        # EOF — nuclei exited normally
-                        break
-
-                    last_activity = time.monotonic()  # stdout line received
-                    decoded = line.decode('utf-8', errors='replace').strip()
-                    if not decoded:
-                        continue
-
-                    # Parse JSONL finding
+                        # Parse JSONL finding
+                        try:
+                            data = json.loads(decoded)
+                            finding = self._parse_nuclei_finding(data)
+                            if finding:
+                                findings_count += 1
+                                yield finding
+                        except json.JSONDecodeError:
+                            # Non-JSON line (shouldn't happen with -jsonl -silent)
+                            continue
+                finally:
+                    stderr_task.cancel()
                     try:
-                        data = json.loads(decoded)
-                        finding = self._parse_nuclei_finding(data)
-                        if finding:
-                            findings_count += 1
-                            yield finding
-                    except json.JSONDecodeError:
-                        # Non-JSON line (shouldn't happen with -jsonl -silent)
-                        continue
-            finally:
-                stderr_task.cancel()
-                try:
-                    await stderr_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-                # Ensure process is terminated
-                if process.returncode is None:
-                    process.kill()
-                await process.wait()
+                        await stderr_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    if watch_task:
+                        watch_task.cancel()
+                        try:
+                            await watch_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    if process.returncode is None:
+                        if interrupted_for_restart:
+                            # Give nuclei a moment to flush its resume
+                            # checkpoint after SIGINT before forcing it down.
+                            try:
+                                await asyncio.wait_for(process.wait(), timeout=10)
+                            except asyncio.TimeoutError:
+                                process.kill()
+                                await process.wait()
+                        else:
+                            process.kill()
+                            await process.wait()
+                    else:
+                        await process.wait()
+
+                stderr_lines.extend(attempt_stderr_lines)
+
+                if not interrupted_for_restart:
+                    break
+
+                rate_drop_restarts += 1
+                new_rate = get_host_rate_ceiling(watch_host, current_rate)
+                new_rate = max(1, min(current_rate, int(new_rate)))
+                if new_rate >= current_rate:
+                    # Registry didn't actually give us a lower number
+                    # (race between the drop and our read) — no point
+                    # burning another attempt.
+                    break
+                current_rate = new_rate
+
             total_elapsed = int(time.monotonic() - wall_start)
 
             # Check for fatal errors in stderr
@@ -1177,6 +1442,23 @@ class NucleiScanner(BaseScanner):
                 self.log("[nuclei] WARNING: 0 templates loaded — templates may not be installed")
             if targets_loaded == 0 and not fatal_errors:
                 self.log("[nuclei] WARNING: 0 targets loaded — target list may be empty")
+            # nuclei's own "errors" stat only counts connection-level
+            # failures — HTTP 429 is a successful round-trip as far as
+            # nuclei is concerned, so a WAF-throttled scan can report a
+            # clean error rate while most requests were actually rejected.
+            # rate_drop_restarts is the real signal for that case: it only
+            # increments when the shared per-host rate ceiling (fed by
+            # every scanner's 429 backoff, see base.py _HostRateRegistry)
+            # dropped out from under this scan.
+            if rate_drop_restarts:
+                self.log(
+                    f"[nuclei] WARNING: scan was interrupted and resumed "
+                    f"{rate_drop_restarts} time(s) after other traffic to "
+                    f"{watch_host} dropped the shared rate ceiling below "
+                    f"{self._rate_limit} rps (final rate: {current_rate} rps) "
+                    f"— target is likely rate-limiting/WAF-throttling; "
+                    f"findings may be incomplete"
+                )
             if total_requests > 0 and total_errors > 0:
                 error_pct = (total_errors / total_requests) * 100
                 if error_pct > 50:
@@ -1187,7 +1469,7 @@ class NucleiScanner(BaseScanner):
 
             # Sanity check: flag impossibly fast completions
             url_count = len(effective_targets)
-            effective_rate = self._rate_limit or 10
+            effective_rate = current_rate or self._rate_limit or 10
             # Minimum plausible time: at least 1 request per URL at the rate limit
             min_plausible_seconds = max(1, url_count // max(1, effective_rate))
             if (findings_count == 0 and total_elapsed < min_plausible_seconds
@@ -1203,6 +1485,10 @@ class NucleiScanner(BaseScanner):
         finally:
             try:
                 Path(target_file).unlink()
+            except Exception:
+                pass
+            try:
+                Path(target_file + ".resume").unlink()
             except Exception:
                 pass
 

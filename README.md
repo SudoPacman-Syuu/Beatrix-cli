@@ -6,7 +6,7 @@
 
 **License:** Source Available — Free for non-commercial use. Commercial use requires a separate license. See [LICENSE](LICENSE).
 
-A command-line bug bounty hunting framework. 32 scanner modules, 13 external tool integrations, full OWASP Top 10 coverage, a 7-phase Kill Chain methodology, and AI-assisted analysis. Targets can be domains, URLs, or raw IP addresses.
+A command-line bug bounty hunting framework. 32 scanner modules, 22 external tool integrations, 57K+ payloads, a 7-phase Kill Chain methodology, and AI-assisted analysis. Targets can be domains, URLs, or raw IP addresses.
 
 ---
 
@@ -57,7 +57,7 @@ Beatrix is the orchestration layer that was missing.
 | 7-phase Kill Chain methodology | ✅ | ❌ | ❌ |
 | Auto-login & session management | ✅ | ❌ | Manual |
 | Autonomous AI pentester (GHOST) | ✅ | ❌ | ❌ |
-| 13 external tool orchestration | ✅ | ❌ | ❌ |
+| 22 external tool orchestration | ✅ | ❌ | ❌ |
 | Built-in OOB / PoC server | ✅ | ❌ | ✅ (Collaborator) |
 | Authenticated crawling | ✅ | ❌ | ✅ |
 | CLI / automation-friendly | ✅ | ✅ | ❌ |
@@ -235,16 +235,16 @@ Every `hunt` runs a 7-phase methodology. Phases run sequentially; the output of 
 Detects Cloudflare, Akamai, Fastly, CloudFront, Sucuri, Incapsula, PerimeterX, DataDome, and Kasada via IP range and header fingerprinting. Discovers origin IPs through DNS history, crt.sh SSL certificates, MX records, subdomain correlation, misconfiguration checks, and WHOIS. When an origin IP is confirmed, all subsequent network scans target it directly rather than the CDN edge. Optional API keys (SecurityTrails, Censys, Shodan) extend this via environment variables.
 
 **Phase 2 — Reconnaissance**
-Subdomain enumeration via `subfinder` and `amass`, crawling via `katana`, `gospider`, `hakrawler`, and `gau`, full 65535-port TCP scan via `nmap -sS -p-` against origin IP when available, service fingerprinting, NSE vuln/discovery/auth scripts, UDP top-50 scan, firewall fingerprinting and bypass testing via `scapy`, SSH deep audit via `paramiko`, JS bundle analysis, endpoint probing, tech fingerprinting via `whatweb` and `webanalyze`, nuclei recon templates, and nuclei network protocol checks.
+Subdomain enumeration via `subfinder` and `amass`, crawling via `katana`, `gospider`, `hakrawler`, and `gau` (with `waymore` for deeper historical URL mining when present), full 65535-port TCP scan via `nmap -sS -p-` against origin IP when available, service fingerprinting, NSE vuln/discovery/auth scripts, UDP top-50 scan, firewall fingerprinting and bypass testing via `scapy`, SSH deep audit via `paramiko`, JS bundle analysis, endpoint probing, API route discovery via `kiterunner`, hidden parameter mining via `arjun`, deep TLS fingerprinting via `tlsx`, tech fingerprinting via `whatweb` and `webanalyze`, nuclei recon templates, and nuclei network protocol checks.
 
 **Phase 3 — Weaponization**
-Subdomain takeover (30+ cloud services), error disclosure, cache poisoning, prototype pollution.
+Subdomain takeover (30+ cloud services), error disclosure, cache poisoning, prototype pollution, and systematic 403 bypass via `nomore403` when present.
 
 **Phase 4 — Delivery**
 CORS, open redirects, OAuth redirect URI manipulation, HTTP request smuggling (CL.TE / TE.CL / TE.TE), WebSocket testing.
 
 **Phase 5 — Exploitation**
-Injection (SQLi, XSS, CMDi) with `response_analyzer` behavioral detection and WAF bypass fallback (11 WAF profiles, 3-strategy retry with adaptive learning), SSRF, IDOR, broken access control, auth bypass, SSTI, XXE, deserialization, GraphQL, mass assignment, business logic, ReDoS, payment flow manipulation, nuclei exploit scan (CVEs, workflows, interactsh OOB, WAF bypass via realistic UA and CDN-aware rate limiting), and nuclei headless (DOM XSS, prototype pollution). SmartFuzzer runs ffuf-verified fuzzing with profile-targeted WAF encoding. Confirmed findings are escalated to `sqlmap`, `dalfox`, `commix`, and `jwt_tool`.
+Injection (SQLi, XSS, CMDi) with `response_analyzer` behavioral detection and WAF bypass fallback (11 WAF profiles, 3-strategy retry with adaptive learning), SSRF, IDOR, broken access control, auth bypass, SSTI, XXE, deserialization, GraphQL (with `clairvoyance` schema reconstruction when introspection is disabled), mass assignment, business logic (including single-packet / last-byte-sync race-condition testing), ReDoS, payment flow manipulation, CRLF injection via `crlfuzz`, nuclei exploit scan (CVEs, workflows, interactsh OOB, WAF bypass via realistic UA and CDN-aware rate limiting), and nuclei headless (DOM XSS, prototype pollution). Nuclei samples large URL sets down to a representative set and shares a per-host rate ceiling with the other scanners, so a 429 flood seen by one scanner throttles nuclei on the same host. SmartFuzzer runs ffuf-verified fuzzing with profile-targeted WAF encoding. Confirmed findings are escalated to `sqlmap`, `dalfox`, `commix`, and `jwt_tool`.
 
 **Phase 6 — Installation**
 File upload extension bypass, polyglot uploads, path traversal.
@@ -323,7 +323,7 @@ Run `beatrix arsenal` for the full table. 32 modules across 5 kill chain phases.
 
 ## External Tool Integrations
 
-Beatrix wraps 13 external tools via async subprocess runners. All runners support real-time output streaming when `-vvv` is active.
+Beatrix wraps 22 external tools via async subprocess runners. All runners support real-time output streaming when `-vvv` is active.
 
 | Tool | Phase | Purpose |
 |------|-------|---------|
@@ -334,14 +334,23 @@ Beatrix wraps 13 external tools via async subprocess runners. All runners suppor
 | `gospider` | Recon | Fast crawling, form and JS extraction |
 | `hakrawler` | Recon | URL discovery |
 | `gau` | Recon | Historical URL harvesting |
+| `waymore` † | Recon | Exhaustive historical URL mining (Wayback, OTX, URLScan, Common Crawl) beyond `gau` |
 | `whatweb` | Recon | Technology fingerprinting |
 | `webanalyze` | Recon | Wappalyzer-based tech detection |
 | `dirsearch` | Recon | Directory brute-forcing |
+| `kiterunner` † | Recon | API route discovery via real-world (assetnote) route wordlists |
+| `arjun` † | Recon | Hidden GET/POST/JSON parameter discovery |
+| `tlsx` † | Recon | TLS certificate inspection and cipher-suite enumeration |
+| `nomore403` † | Weaponization | Systematic 403 bypass via header manipulation and path tricks |
+| `clairvoyance` † | Exploitation | GraphQL schema reconstruction despite disabled introspection |
+| `crlfuzz` † | Exploitation | Dedicated CRLF injection / response-splitting scanner |
 | `sqlmap` | Exploitation | Deep SQLi exploitation, DB enumeration |
 | `dalfox` | Exploitation | XSS validation, WAF bypass |
 | `commix` | Exploitation | OS command injection exploitation |
 | `jwt_tool` | Exploitation | JWT vulnerability analysis, claim tampering |
 | `metasploit` | PoC Chain | Exploit search, resource file generation |
+
+**†** These seven tools are **optional** — Beatrix auto-detects them on your `PATH` and runs them when present, but `./install.sh` / `beatrix setup` does **not** install them (they cover 21 core tools). Install any of them yourself to unlock the extra coverage; Beatrix degrades gracefully when they're absent.
 
 ---
 
@@ -571,9 +580,36 @@ beatrix auth show -t example.com
 
 Beatrix scores every entry in the HAR by request URL (preferring authenticated API calls over static assets), extracts the best `Cookie` header, `Authorization: Bearer` token, and any `X-Api-Key` / `X-Auth-Token` headers, then saves the result as a normal session file that all scanners pick up automatically.
 
+### IDOR Dual-Account Setup from HAR
+
+The IDOR scanner needs two authenticated accounts to prove cross-user access. Rather than handing Beatrix two sets of credentials (and dealing with 2FA twice), capture a HAR for each account and load them straight into the IDOR slots with `--idor-slot`:
+
+```bash
+# Capture a HAR while logged in as each account, then import one per slot
+beatrix auth import example.com account1.har --idor-slot user1
+beatrix auth import example.com account2.har --idor-slot user2
+
+# Now hunt — the IDOR scanner swaps between the two sessions per request
+beatrix hunt example.com
+```
+
+Each import merges into `~/.beatrix/auth.yaml` under `idor.<slot>` without clobbering the other slot, so the two commands are independent. Because a HAR captures an already-authenticated session, this works around 2FA entirely — no credentials are stored.
+
+### Bot-Fingerprinting Targets (Browser Auth)
+
+Some targets (e.g. Akamai bot management) fingerprint scripted HTTP clients and block or redirect an otherwise-valid authenticated session regardless of correct cookies. Beatrix's `SessionValidator` auto-detects this — when an `httpx`-based session probe fails but a real-Chromium probe succeeds, authenticated scanner requests are routed through a Playwright-backed transport (`browser_transport.py`) that shares Chromium's real TLS/network fingerprint.
+
+The auto-detection samples a fixed list of common auth-check paths, so it can miss path-specific blocking. Force browser-backed authenticated requests with `--browser-auth`:
+
+```bash
+beatrix hunt example.com --browser-auth
+```
+
+This is slower per request and only affects authenticated scanner traffic (not bulk unauthenticated requests). Requires Playwright (installed by `beatrix setup`).
+
 ### Session Persistence
 
-Authenticated sessions are saved to `~/.beatrix/sessions/<domain>.json` and reused for 24 hours. If the session contains a JWT, Beatrix additionally checks the token's `exp` claim on every load — a token expiring within 5 minutes is discarded automatically so stale sessions never reach scanners.
+Authenticated sessions are saved to `~/.beatrix/sessions/<domain>.json` and reused for 24 hours. If the session contains a JWT, Beatrix additionally checks the token's `exp` claim on every load — a token expiring within 5 minutes is discarded automatically so stale sessions never reach scanners. During a scan, `SessionValidator` periodically re-probes the target and triggers re-authentication if the session goes dead mid-hunt.
 
 ```bash
 beatrix auth sessions                         # list all saved sessions
@@ -737,7 +773,9 @@ beatrix/
 │   ├── nmap_scanner.py       # Full TCP/UDP scanning, NSE scripts
 │   ├── packet_crafter.py     # Scapy firewall fingerprint, source-port/fragment bypass
 │   ├── ssh_auditor.py        # SSH fingerprint, weak crypto, default credential brute-force
-│   ├── external_tools.py     # 13 async subprocess tool runners with streaming support
+│   ├── external_tools.py     # 20 async subprocess tool runners with streaming support
+│   ├── browser_transport.py  # Chromium-backed HTTP transport for bot-fingerprinting targets
+│   ├── auth_config.py        # Auth credentials + SessionValidator (session liveness, browser fallback)
 │   ├── types.py              # Finding, Severity, Confidence, ScanContext
 │   ├── seclists_manager.py   # Dynamic wordlist engine (SecLists + PayloadsAllTheThings)
 │   ├── oob_detector.py       # OOB callback manager (LocalPoCClient + interactsh)

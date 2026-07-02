@@ -415,6 +415,11 @@ class KillChainExecutor:
                     # Inject auth headers into the scanner's HTTP client
                     if context.get("auth") and hasattr(scanner, 'apply_auth'):
                         scanner.apply_auth(context["auth"])
+                    # Target fingerprints scripted HTTP clients (see
+                    # SessionValidator.needs_browser_transport) — route this
+                    # scanner's requests through a real browser instead.
+                    if context.get("needs_browser_transport") and hasattr(scanner, 'enable_browser_transport'):
+                        await scanner.enable_browser_transport()
                     # Inject WAF profile into scanner for payload encoding
                     if cdn_name and hasattr(scanner, 'set_waf_profile'):
                         scanner.set_waf_profile(cdn_name.lower())
@@ -559,6 +564,12 @@ class KillChainExecutor:
                     # Inject auth headers into the scanner's HTTP client
                     if context.get("auth") and hasattr(scanner, 'apply_auth'):
                         scanner.apply_auth(context["auth"])
+
+                    # Target fingerprints scripted HTTP clients (see
+                    # SessionValidator.needs_browser_transport) — route this
+                    # scanner's requests through a real browser instead.
+                    if context.get("needs_browser_transport") and hasattr(scanner, 'enable_browser_transport'):
+                        await scanner.enable_browser_transport()
 
                     # Inject WAF profile into scanner for payload encoding
                     cdn_name = (context.get("network") or {}).get("cdn_detected")
@@ -1775,6 +1786,38 @@ class KillChainExecutor:
                     except Exception as e:
                         self._emit("scanner_error", scanner="nuclei_network", error=str(e))
 
+        elif not target_is_ip:
+            # ── Fast-path CDN/WAF detection for non-deep-recon presets ──
+            # Presets like "quick"/"standard" set an explicit module list,
+            # so run_deep_recon is False and the full Phase 0 pipeline above
+            # (DNS history, crt.sh, WHOIS, subdomain correlation — several
+            # seconds of API calls) never runs. But nuclei_recon and the
+            # WAF-aware rate throttling below both read
+            # context["network"]["cdn_detected"] unconditionally, regardless
+            # of preset. Without at least this, they always see None and
+            # nuclei launches at full rate against a target that may be
+            # obviously behind a CDN/WAF — backing off only after already
+            # eating a 429 flood. A bare DNS-range + header check is one
+            # resolve and one HTTP request, cheap enough to always run.
+            try:
+                from beatrix.scanners.origin_ip_discovery import OriginIPDiscovery
+                cdn_name, cdn_ips = await OriginIPDiscovery().detect_cdn(domain)
+                context["network"] = {
+                    "open_ports": [], "filtered_ports": [], "services": {},
+                    "firewall_profile": {}, "bypass_findings": [], "nse_findings": [],
+                    "ssh_audit": [], "origin_ips": [],
+                    "cdn_detected": cdn_name, "cdn_ips": cdn_ips,
+                    "scan_target": domain, "findings": [],
+                }
+                if cdn_name:
+                    self._emit("info", message=(
+                        f"CDN/WAF detected — {cdn_name} (fast header check; "
+                        f"full origin-IP discovery skipped for this preset)"
+                    ))
+            except Exception as e:
+                context["network"] = {"cdn_detected": None, "cdn_ips": [], "scan_target": domain}
+                self._emit("scanner_error", scanner="cdn_fast_detect", error=str(e))
+
         # ── Step 2b: Crawl non-standard HTTP ports (T1595.001) ───────────
         # When nmap discovers HTTP services on ports other than 80/443,
         # crawl them to expand the attack surface beyond the primary URL.
@@ -1844,6 +1887,25 @@ class KillChainExecutor:
                     except Exception as e:
                         self._emit("scanner_error", scanner="gau", error=str(e))
 
+                # Waymore — deeper historical URL mining beyond gau
+                # Covers URLscan.io and VirusTotal sources gau omits,
+                # exposing legacy /api/v1/ paths and forgotten upload endpoints.
+                if toolkit.waymore.available:
+                    self._emit("info", message=f"Running waymore on {domain} (extended historical URL discovery)")
+                    try:
+                        wm_urls = await toolkit.waymore.fetch_urls(domain)
+                        added = 0
+                        for u in wm_urls:
+                            if u not in discovered_urls:
+                                discovered_urls.add(u)
+                                added += 1
+                                if "?" in u:
+                                    urls_with_params.add(u)
+                        if added:
+                            self._emit("info", message=f"Waymore added {added} new historical URLs")
+                    except Exception as e:
+                        self._emit("scanner_error", scanner="waymore", error=str(e))
+
                 # Katana — deep JS crawling and endpoint extraction
                 if toolkit.katana.available:
                     self._emit("info", message=f"Running katana on {url} (deep JS crawling)")
@@ -1910,6 +1972,56 @@ class KillChainExecutor:
                     except Exception as e:
                         self._emit("scanner_error", scanner="hakrawler", error=str(e))
 
+                # Kiterunner — API route brute-forcing with real-world wordlists
+                # Discovers /api/v1/*, /graphql, /internal/* endpoints that crawlers miss.
+                if toolkit.kiterunner.available:
+                    self._emit("info", message=f"Running kiterunner on {url} (API route discovery)")
+                    try:
+                        kr_result = await toolkit.kiterunner.scan(url)
+                        for ep in kr_result.get("endpoints", []):
+                            ep_url = ep.get("url", "")
+                            if ep_url.startswith("http"):
+                                discovered_urls.add(ep_url)
+                                if "?" in ep_url:
+                                    urls_with_params.add(ep_url)
+                        n_found = kr_result.get("total", 0)
+                        if n_found:
+                            context.setdefault("kiterunner_endpoints", []).extend(
+                                kr_result.get("endpoints", [])
+                            )
+                            self._emit("info", message=f"Kiterunner found {n_found} API endpoints")
+                    except Exception as e:
+                        self._emit("scanner_error", scanner="kiterunner", error=str(e))
+
+                # Arjun — hidden parameter discovery on high-value endpoints
+                # Finds undocumented GET/POST params that open injection surfaces.
+                if toolkit.arjun.available:
+                    # Run on the base URL + any API/form endpoints discovered
+                    arjun_targets = [url]
+                    for u in list(discovered_urls)[:20]:  # cap to avoid runaway
+                        u_lower = u.lower()
+                        if any(seg in u_lower for seg in (
+                            "/api/", "/v1/", "/v2/", "/search", "/query",
+                            "/form", "/submit", "/contact",
+                        )):
+                            arjun_targets.append(u)
+                    arjun_targets = list(dict.fromkeys(arjun_targets))[:10]
+                    self._emit("info", message=f"Running arjun on {len(arjun_targets)} endpoints (hidden param discovery)")
+                    for at in arjun_targets:
+                        try:
+                            arjun_result = await toolkit.arjun.discover(at, method="GET")
+                            found_params = arjun_result.get("params", [])
+                            if found_params:
+                                from urllib.parse import urlencode, urlparse as _up_a, urlunparse as _uu_a
+                                parsed_at = _up_a(at)
+                                query_str = urlencode({p: "FUZZ" for p in found_params})
+                                param_url = _uu_a(parsed_at._replace(query=query_str))
+                                urls_with_params.add(param_url)
+                                context.setdefault("hidden_params", {})[at] = found_params
+                                self._emit("info", message=f"Arjun found {len(found_params)} hidden params on {at}: {found_params}")
+                        except Exception as e:
+                            self._emit("scanner_error", scanner="arjun", error=str(e))
+
                 # Merge all discovered URLs back into context
                 context["discovered_urls"] = sorted(discovered_urls)
                 context["urls_with_params"] = sorted(urls_with_params)
@@ -1968,6 +2080,80 @@ class KillChainExecutor:
                 }, phase=1)
             except Exception:
                 pass
+
+        # ── Step 3a-ii-b: tlsx — deep TLS fingerprinting (T1596.003) ────────
+        # Augments extract_ssl_sans: catches weak cipher suites, legacy TLS
+        # versions (SSLv3/TLSv1.0), expired certs, and JARM fingerprints.
+        if run_deep_recon and not target_is_ip:
+            try:
+                _tlsx_toolkit = self.toolkit
+                if _tlsx_toolkit.tlsx.available:
+                    _tlsx_port = 443
+                    # Pick the HTTPS port from nmap results if non-standard
+                    for _portinfo in context.get("network", {}).get("open_ports", []):
+                        if isinstance(_portinfo, dict) and _portinfo.get("service", "").lower() in ("https", "ssl/http"):
+                            _tlsx_port = _portinfo["port"]
+                            break
+                    self._emit("info", message=f"Running tlsx on {domain}:{_tlsx_port} (TLS fingerprinting)")
+                    _tlsx_result = await _tlsx_toolkit.tlsx.scan(domain, port=_tlsx_port)
+                    context["tls_info"] = _tlsx_result
+
+                    # Feed SAN domains into subdomain set
+                    _new_tls_subs = [
+                        h for h in _tlsx_result.get("san_domains", [])
+                        if h and not h.startswith("*") and h != domain
+                        and h not in set(context.get("subdomains", []))
+                    ]
+                    if _new_tls_subs:
+                        context.setdefault("subdomains", []).extend(_new_tls_subs)
+                        self._emit("info", message=f"tlsx SAN: {len(_new_tls_subs)} additional subdomains from cert")
+
+                    # Emit findings for weak TLS configs
+                    _tls_findings = []
+                    from beatrix.core.types import Finding, Severity, Confidence
+                    if _tlsx_result.get("weak_ciphers"):
+                        _tls_findings.append(Finding(
+                            severity=Severity.MEDIUM,
+                            confidence=Confidence.CONFIRMED,
+                            url=f"https://{domain}:{_tlsx_port}",
+                            title=f"Weak TLS cipher suites: {', '.join(_tlsx_result['weak_ciphers'][:5])}",
+                            description=(
+                                f"Server supports weak cipher suites that enable downgrade attacks.\n"
+                                f"Weak ciphers: {', '.join(_tlsx_result['weak_ciphers'])}"
+                            ),
+                            evidence=_tlsx_result,
+                            scanner_module="tlsx",
+                        ))
+                    if _tlsx_result.get("expired"):
+                        _tls_findings.append(Finding(
+                            severity=Severity.MEDIUM,
+                            confidence=Confidence.CONFIRMED,
+                            url=f"https://{domain}:{_tlsx_port}",
+                            title=f"Expired TLS certificate (expired {_tlsx_result.get('expiry_date', 'unknown')})",
+                            description="The TLS certificate has expired. Browsers will show a warning and HSTS pinning may fail.",
+                            evidence=_tlsx_result,
+                            scanner_module="tlsx",
+                        ))
+                    _weak_versions = [v for v in _tlsx_result.get("tls_versions", [])
+                                      if v in ("SSLv3", "TLSv1", "TLSv1.0", "TLSv1.1")]
+                    if _weak_versions:
+                        _tls_findings.append(Finding(
+                            severity=Severity.MEDIUM,
+                            confidence=Confidence.CONFIRMED,
+                            url=f"https://{domain}:{_tlsx_port}",
+                            title=f"Legacy TLS versions supported: {', '.join(_weak_versions)}",
+                            description=(
+                                f"Server accepts deprecated TLS versions vulnerable to POODLE, BEAST, or LUCKY13.\n"
+                                f"Versions detected: {', '.join(_weak_versions)}"
+                            ),
+                            evidence=_tlsx_result,
+                            scanner_module="tlsx",
+                        ))
+                    if _tls_findings:
+                        results.append({"findings": _tls_findings, "assets": [], "context": {}, "modules": ["tlsx"], "requests": 0})
+                        self._emit("info", message=f"tlsx: {len(_tls_findings)} TLS finding(s) on {domain}")
+            except Exception as e:
+                self._emit("scanner_error", scanner="tlsx", error=str(e))
 
         # ── Step 3a-iii: DNS record analysis (T1590.002 + T1596.001) ─────
         # Comprehensive DNS recon: MX, TXT, NS, CNAME, SOA + SPF/DMARC analysis.
@@ -2234,7 +2420,6 @@ class KillChainExecutor:
 
         # ── Step 6-9: Run recon scanners concurrently ─────────────────────
         # These scanners are independent — run them in parallel for speed
-        import asyncio
 
         js_scan_ctx = None
         js_files = context.get("js_files", [])
@@ -3114,6 +3299,15 @@ class KillChainExecutor:
             context["urls_with_params"] = urls_with_params
             self._emit("info", message=f"Recovered {len(_extra_param_urls)} parameterized URLs from discovered_urls into injection targets")
 
+        # Augment crawl_extra with the final post-recon URL sets so that
+        # scanners reading context.extra["discovered_urls"] / ["urls_with_params"]
+        # (backslash, param_miner) get the full attack surface, not just the
+        # initial crawl output.
+        if "crawl_extra" not in context:
+            context["crawl_extra"] = {}
+        context["crawl_extra"]["discovered_urls"] = context.get("discovered_urls", [])
+        context["crawl_extra"]["urls_with_params"] = urls_with_params
+
         # Build a combined target list: URLs with params PLUS JS-discovered API endpoints
         # AND functional pages that accept user input (cart, checkout, search, login, etc.)
         # Many JS routes (e.g. /api/v1/users, /resource/feed) lack query params but
@@ -3150,12 +3344,23 @@ class KillChainExecutor:
             results.append(await self._run_scanner_on_urls("ssrf", deduped, context))
             results.append(await self._run_scanner_on_urls("mass_assignment", deduped[:30], context))
             results.append(await self._run_scanner_on_urls("redos", deduped[:20], context))
+            # Backslash-powered scanning — probe injection context first, then
+            # attack with targeted payloads. Finds SQL/SSTI/XSS the generic
+            # injection scanner misses by avoiding false payload spraying.
+            results.append(await self._run_scanner_on_urls("backslash", deduped[:50], context))
         else:
             results.append(await self._run_scanner("injection", url, context))
             results.append(await self._run_scanner("ssti", url, context))
             results.append(await self._run_scanner("ssrf", url, context))
             results.append(await self._run_scanner("mass_assignment", url, context))
             results.append(await self._run_scanner("redos", url, context))
+            results.append(await self._run_scanner("backslash", url, context))
+
+        # ── Param Miner — hidden parameter discovery ──────────────────────────
+        # Batch-probes candidate param names and bisects on response diff.
+        # Finds cache poisoning vectors, debug params (?debug=1), and
+        # privilege escalation fields (?role=admin) that crawlers miss.
+        results.append(await self._run_scanner("param_miner", url, context))
 
         # ── XXE — targets XML-accepting endpoints ─────────────────────────────
         # Also test discovered API endpoints that might accept XML
@@ -3214,8 +3419,46 @@ class KillChainExecutor:
         if auth_endpoints:
             results.append(await self._run_scanner_on_urls("bac", auth_endpoints[:15], context))
 
+        # ── Sequencer — statistical token entropy analysis ────────────────────
+        # Collects session IDs / CSRF tokens from token-issuing endpoints and
+        # runs FIPS 140-2 monobit, poker, runs tests + Shannon entropy + chi².
+        # Predictable tokens (low entropy, high serial correlation) are flagged.
+        _token_endpoints = [url]
+        for _te in context.get("discovered_urls", []):
+            _te_lower = _te.lower()
+            if any(seg in _te_lower for seg in (
+                "/login", "/register", "/signup", "/forgot", "/reset",
+                "/session", "/auth", "/token", "/oauth",
+            )):
+                _token_endpoints.append(_te)
+        _token_endpoints = list(dict.fromkeys(_token_endpoints))[:8]
+        results.append(await self._run_scanner_on_urls("sequencer", _token_endpoints, context))
+
         # ── GraphQL — discovers and tests GraphQL endpoints ───────────────────
         results.append(await self._run_scanner("graphql", url, context))
+
+        # ── Clairvoyance — GraphQL schema reconstruction via field enumeration ─
+        # Recovers hidden/unexposed types and mutations from GraphQL endpoints
+        # that disable introspection, giving a fuller attack surface picture.
+        toolkit = getattr(self.engine, "external_toolkit", None)
+        if toolkit and toolkit.clairvoyance.available:
+            graphql_endpoints = [
+                u for u in context.get("discovered_urls", [])
+                if any(seg in u.lower() for seg in ("/graphql", "/api/graphql", "/gql", "/query"))
+            ]
+            if not graphql_endpoints:
+                graphql_endpoints = [url]
+            for gql_url in graphql_endpoints[:5]:
+                try:
+                    self._emit("info", message=f"Running clairvoyance on {gql_url} (GraphQL schema reconstruction)")
+                    cv_result = await toolkit.clairvoyance.reconstruct_schema(gql_url)
+                    if cv_result.get("success"):
+                        context.setdefault("graphql_schemas", {})[gql_url] = cv_result
+                        n_types = len(cv_result.get("types", []))
+                        n_mutations = len(cv_result.get("mutations", []))
+                        self._emit("info", message=f"Clairvoyance recovered schema: {n_types} types, {n_mutations} mutations on {gql_url}")
+                except Exception as e:
+                    self._emit("scanner_error", scanner="clairvoyance", error=str(e))
 
         # ── Business logic — boundary conditions, race conditions ─────────────
         results.append(await self._run_scanner("business_logic", url, context))
@@ -3562,6 +3805,195 @@ class KillChainExecutor:
                 self._emit("info", message="SmartFuzzer unavailable (ffuf not installed)")
             except Exception as e:
                 self._emit("scanner_error", scanner="smart_fuzzer", error=str(e))
+
+        # ── Proactive dalfox — XSS sweep on ALL param URLs ────────────────────
+        # Runs before the confirmed-only pass so we catch XSS even when nuclei/
+        # internal scanners didn't flag an indicator first (common on WAF-heavy
+        # targets that silently absorb payloads without triggering heuristics).
+        try:
+            _toolkit_proactive = self.toolkit
+            if _toolkit_proactive.dalfox.available:
+                _param_urls = list(context.get("urls_with_params", set()))
+                # Score and sort: prefer shorter paths and high-risk param names
+                _HIGH_RISK_XSS_PARAMS = {
+                    "q", "query", "search", "s", "keyword", "term",
+                    "redirect", "url", "next", "return", "callback",
+                    "ref", "referrer", "from", "to", "page", "title",
+                    "name", "content", "msg", "message", "text", "comment",
+                    "data", "input", "value", "param",
+                }
+
+                def _xss_priority(u: str) -> int:
+                    from urllib.parse import urlparse, parse_qs
+                    try:
+                        p = urlparse(u)
+                        qs = parse_qs(p.query)
+                        score = 0
+                        if any(k.lower() in _HIGH_RISK_XSS_PARAMS for k in qs):
+                            score -= 50
+                        score += len(p.path.split("/")) * 5
+                        return score
+                    except Exception:
+                        return 0
+
+                _param_urls.sort(key=_xss_priority)
+                _dalfox_proactive = _param_urls[:30]  # cap to avoid runaway
+                if _dalfox_proactive:
+                    self._emit("info", message=f"Proactive dalfox sweep on {len(_dalfox_proactive)} param URLs")
+                for _df_url in _dalfox_proactive:
+                    try:
+                        _df_hits = await _toolkit_proactive.dalfox.scan(_df_url)
+                        for _df in _df_hits:
+                            _poc = _df.get("payload") or _df.get("poc", "")
+                            from beatrix.core.types import Finding, Severity
+                            results.append({"findings": [Finding(
+                                severity=Severity.HIGH,
+                                url=_df_url,
+                                title=f"dalfox — XSS: {_df.get('type', 'reflected')}",
+                                description=(
+                                    f"dalfox proactive scan found XSS.\n"
+                                    f"Type: {_df.get('type')}\n"
+                                    f"Payload: {_poc}"
+                                ),
+                                evidence=_df,
+                                scanner_module="dalfox",
+                            )], "assets": [], "context": {}, "modules": ["dalfox"], "requests": 0})
+                            self._emit("info", message=f"dalfox proactive XSS on {_df_url}")
+                    except Exception as e:
+                        self._emit("scanner_error", scanner="dalfox_proactive", error=str(e))
+        except Exception as e:
+            self._emit("scanner_error", scanner="dalfox_proactive", error=str(e))
+
+        # ── Proactive sqlmap — SQLi sweep on high-risk param URLs ─────────────
+        # Runs before the confirmed-only pass. Targets URLs that carry params
+        # commonly injectable (id, user_id, search, etc.) without waiting for
+        # an internal scanner to surface an indicator first.
+        try:
+            _toolkit_sqli = self.toolkit
+            if _toolkit_sqli.sqlmap.available:
+                _SQLI_RISK_PARAMS = {
+                    "id", "user_id", "uid", "pid", "item_id", "order_id",
+                    "product_id", "cat", "category_id", "page_id",
+                    "q", "query", "search", "keyword", "s",
+                    "name", "username", "email",
+                    "year", "month", "day", "sort", "order", "dir",
+                }
+                _sqli_proactive: list = []
+                from urllib.parse import urlparse as _up_sq, parse_qs as _pq_sq
+                for _pu in context.get("urls_with_params", []):
+                    try:
+                        _pqs = _pq_sq(_up_sq(_pu).query)
+                        if any(k.lower() in _SQLI_RISK_PARAMS for k in _pqs):
+                            _sqli_proactive.append(_pu)
+                    except Exception:
+                        pass
+                _sqli_proactive = _sqli_proactive[:15]  # cap: sqlmap is slow
+                if _sqli_proactive:
+                    self._emit("info", message=f"Proactive sqlmap sweep on {len(_sqli_proactive)} high-risk param URLs")
+                for _sq_url in _sqli_proactive:
+                    try:
+                        _sq_result = await _toolkit_sqli.sqlmap.exploit(url=_sq_url)
+                        if _sq_result.get("vulnerable"):
+                            from beatrix.core.types import Finding, Severity
+                            results.append({"findings": [Finding(
+                                severity=Severity.CRITICAL,
+                                url=_sq_url,
+                                title=f"sqlmap proactive — SQLi (DBMS: {_sq_result.get('dbms', 'unknown')})",
+                                description=(
+                                    f"sqlmap proactive scan confirmed SQL injection.\n"
+                                    f"DBMS: {_sq_result.get('dbms')}\n"
+                                    f"Current DB: {_sq_result.get('current_db')}\n"
+                                    f"Current User: {_sq_result.get('current_user')}\n"
+                                    f"DBA: {_sq_result.get('is_dba')}\n"
+                                    f"Databases: {', '.join(_sq_result.get('databases', []))}\n"
+                                    f"Injection type: {_sq_result.get('injection_type')}"
+                                ),
+                                evidence=_sq_result,
+                                scanner_module="sqlmap",
+                            )], "assets": [], "context": {}, "modules": ["sqlmap"], "requests": 0})
+                            self._emit("info", message=f"sqlmap proactive CONFIRMED SQLi on {_sq_url}")
+                    except Exception as e:
+                        self._emit("scanner_error", scanner="sqlmap_proactive", error=str(e))
+        except Exception as e:
+            self._emit("scanner_error", scanner="sqlmap_proactive", error=str(e))
+
+        # ── nomore403 — systematic 403 bypass on access-controlled endpoints ───
+        # Runs on recon-collected 401/403 URLs. Uses header manipulation, method
+        # override, and path tricks to bypass access controls without creds.
+        try:
+            _nm_toolkit = self.toolkit
+            if _nm_toolkit.nomore403.available:
+                _forbidden_urls = list(context.get("auth_protected_endpoints", []))
+                # Also grab any 403/401 findings from this exploit run
+                for _r in results:
+                    for _f in _r.get("findings", []):
+                        _ftitle = getattr(_f, "title", "") or ""
+                        if "403" in _ftitle or "401" in _ftitle or "forbidden" in _ftitle.lower():
+                            _furl = getattr(_f, "url", "")
+                            if _furl and _furl not in _forbidden_urls:
+                                _forbidden_urls.append(_furl)
+                _forbidden_urls = _forbidden_urls[:20]  # cap: each takes ~10s
+                if _forbidden_urls:
+                    self._emit("info", message=f"Running nomore403 on {len(_forbidden_urls)} access-controlled endpoints")
+                for _nm_url in _forbidden_urls:
+                    try:
+                        _nm_result = await _nm_toolkit.nomore403.bypass(_nm_url)
+                        if _nm_result.get("bypassed"):
+                            from beatrix.core.types import Finding, Severity, Confidence
+                            results.append({"findings": [Finding(
+                                severity=Severity.HIGH,
+                                confidence=Confidence.CONFIRMED,
+                                url=_nm_url,
+                                title=f"403 Bypass — {_nm_result.get('technique', 'header manipulation')}",
+                                description=(
+                                    f"nomore403 bypassed access control on {_nm_url}.\n"
+                                    f"Technique: {_nm_result.get('technique')}\n"
+                                    f"Bypass URL: {_nm_result.get('bypass_url')}\n"
+                                    f"Response status: {_nm_result.get('status')}"
+                                ),
+                                evidence=_nm_result,
+                                scanner_module="nomore403",
+                            )], "assets": [], "context": {}, "modules": ["nomore403"], "requests": 0})
+                            self._emit("info", message=f"nomore403 BYPASSED {_nm_url} via {_nm_result.get('technique')}")
+                    except Exception as e:
+                        self._emit("scanner_error", scanner="nomore403", error=str(e))
+        except Exception as e:
+            self._emit("scanner_error", scanner="nomore403", error=str(e))
+
+        # ── crlfuzz — CRLF injection sweep on param URLs ──────────────────────
+        # Dedicated CRLF tool with larger payload set than nuclei's crlf tag.
+        # Catches header injection and response splitting that pattern matching
+        # misses (encoded variants, multi-stage injections).
+        try:
+            _crlf_toolkit = self.toolkit
+            if _crlf_toolkit.crlfuzz.available:
+                _crlf_targets = list(context.get("urls_with_params", []))[:40]
+                if _crlf_targets:
+                    self._emit("info", message=f"Running crlfuzz on {len(_crlf_targets)} param URLs")
+                for _crlf_url in _crlf_targets:
+                    try:
+                        _crlf_result = await _crlf_toolkit.crlfuzz.scan(_crlf_url)
+                        if _crlf_result.get("vulnerable"):
+                            from beatrix.core.types import Finding, Severity, Confidence
+                            for _crlf_hit in _crlf_result.get("findings", []):
+                                results.append({"findings": [Finding(
+                                    severity=Severity.MEDIUM,
+                                    confidence=Confidence.FIRM,
+                                    url=_crlf_url,
+                                    title=f"CRLF Injection — header injection / response splitting",
+                                    description=(
+                                        f"crlfuzz detected CRLF injection on {_crlf_url}.\n"
+                                        f"Injected URL: {_crlf_hit.get('url', _crlf_url)}\n"
+                                        f"Evidence: {_crlf_hit.get('evidence', '')}"
+                                    ),
+                                    evidence=_crlf_hit,
+                                    scanner_module="crlfuzz",
+                                )], "assets": [], "context": {}, "modules": ["crlfuzz"], "requests": 0})
+                                self._emit("info", message=f"crlfuzz CRLF injection on {_crlf_url}")
+                    except Exception as e:
+                        self._emit("scanner_error", scanner="crlfuzz", error=str(e))
+        except Exception as e:
+            self._emit("scanner_error", scanner="crlfuzz", error=str(e))
 
         # ── Deep exploitation — sqlmap, dalfox, commix on confirmed vulns ─────
         # Only run when tools are available AND internal scanners found issues
@@ -4171,13 +4603,46 @@ class KillChainExecutor:
         # looks like, then re-check between phases to detect session death.
         session_validator = None
         auth = state.context.get("auth")
-        if auth and hasattr(auth, 'has_auth') and auth.has_auth:
+        _has_direct_auth = bool(auth and hasattr(auth, 'has_auth') and auth.has_auth)
+        _has_idor_auth = bool(auth and hasattr(auth, 'has_idor_accounts') and auth.has_idor_accounts)
+        if _has_direct_auth or _has_idor_auth:
             try:
                 from beatrix.core.auth_config import SessionValidator
-                session_validator = SessionValidator(target, auth)
+                # IDOR-only configs (e.g. from `auth import --idor-slot`) have
+                # no top-level cookies/headers to calibrate against — use
+                # user1's credentials as the representative session. Whether
+                # the target fingerprints scripted HTTP clients is a
+                # transport-level property, not really account-specific.
+                calibration_creds = auth if _has_direct_auth else auth.idor_user1
+                session_validator = SessionValidator(target, calibration_creds)
                 calibrated = await session_validator.calibrate()
+
+                # One account being dead/expired can produce a spurious httpx
+                # "calibrated" result (e.g. an invalid-but-present cookie
+                # still redirects differently than no cookie at all) that
+                # never even tries the browser-backed probe — masking a real
+                # transport issue on the OTHER, still-valid account. If the
+                # first pass didn't flag browser transport and a second IDOR
+                # account exists, calibrate it too and take the more
+                # conservative result.
+                if calibrated and _has_idor_auth and not _has_direct_auth and not session_validator.needs_browser_transport:
+                    try:
+                        alt_validator = SessionValidator(target, auth.idor_user2)
+                        if await alt_validator.calibrate() and alt_validator.needs_browser_transport:
+                            await session_validator.close()
+                            session_validator = alt_validator
+                    except Exception as e:
+                        self._emit("info", message=f"Secondary IDOR calibration failed: {e}")
+
                 if calibrated:
                     state.context["session_validator"] = session_validator
+                    if session_validator.needs_browser_transport:
+                        state.context["needs_browser_transport"] = True
+                        self._emit("info", message=(
+                            "Session validator: target fingerprints scripted HTTP "
+                            "clients — authenticated scan requests will route "
+                            "through a real browser instead of httpx"
+                        ))
                     self._emit("info", message=(
                         f"Session validator calibrated: "
                         f"{session_validator.fingerprint.check_url}"
@@ -4283,6 +4748,14 @@ class KillChainExecutor:
             if interactsh:
                 try:
                     await interactsh.__aexit__(None, None, None)
+                except Exception:
+                    pass
+
+            # Cleanup session validator's browser client, if calibration
+            # created one (needs_browser_transport path)
+            if session_validator:
+                try:
+                    await session_validator.close()
                 except Exception:
                     pass
 

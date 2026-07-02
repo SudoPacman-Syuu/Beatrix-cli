@@ -299,6 +299,7 @@ class BeatrixEngine:
         ai: bool = False,
         modules: Optional[List[str]] = None,
         auth: Optional[Any] = None,
+        browser_auth: bool = False,
     ) -> KillChainState:
         """
         Execute a hunt against a target.
@@ -309,6 +310,14 @@ class BeatrixEngine:
             ai: Enable AI analysis
             modules: Override modules to run
             auth: AuthCredentials object for authenticated scanning
+            browser_auth: Force authenticated scan requests through a real
+                browser network stack instead of httpx, bypassing
+                SessionValidator's calibration heuristic. Use when you
+                already know (e.g. from manual testing) that the target
+                fingerprints scripted HTTP clients — calibration only
+                samples a fixed list of common auth-check paths, so it can
+                miss path-specific fingerprint blocking that a broader
+                scan would still hit.
 
         Returns:
             KillChainState with all findings
@@ -331,6 +340,9 @@ class BeatrixEngine:
         context = {"modules": modules}
         if auth is not None:
             context["auth"] = auth
+        if browser_auth:
+            context["needs_browser_transport"] = True
+            context["force_browser_transport"] = True  # skip calibration override
 
         # Execute kill chain
         state = await self.kill_chain.execute(

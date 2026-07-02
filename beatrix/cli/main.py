@@ -1178,6 +1178,13 @@ def setup_cmd(ctx, check):
 @click.option("--login-url", default=None, help="Login page URL (auto-detected if omitted)")
 @click.option("--manual-login", is_flag=True, help="Open browser for manual login (handles OTP/captcha)")
 @click.option("--fresh-login", is_flag=True, help="Ignore saved session, force re-authentication")
+@click.option("--browser-auth", is_flag=True,
+              help="Force authenticated requests through a real browser instead of httpx. "
+                   "Use when you already know the target fingerprints scripted HTTP clients "
+                   "(e.g. Akamai bot management) — SessionValidator's auto-detection only "
+                   "samples a fixed list of common auth-check paths and can miss "
+                   "path-specific blocking. Slower per-request; only affects authenticated "
+                   "scanner requests, not bulk unauthenticated traffic.")
 @click.option("--rate-limit", "rate_limit", type=int, default=None,
               help="Max requests per second across all scanners (default: 10). "
                    "Use lower values against WAF-protected targets.")
@@ -1186,7 +1193,7 @@ def setup_cmd(ctx, check):
 @click.pass_context
 def hunt(ctx, target, preset, ai, modules, output, targets_file,
          auth_config, cli_cookies, cli_headers, cli_token, auth_user, auth_pass,
-         login_user, login_pass, login_url, manual_login, fresh_login, rate_limit, verbose):
+         login_user, login_pass, login_url, manual_login, fresh_login, browser_auth, rate_limit, verbose):
     """
     Hunt for vulnerabilities on TARGET or a file of targets.
 
@@ -1257,6 +1264,7 @@ def hunt(ctx, target, preset, ai, modules, output, targets_file,
                     login_url=login_url,
                     manual_login=manual_login,
                     fresh_login=fresh_login,
+                    browser_auth=browser_auth,
                     verbose=verbose,
                 )
                 all_findings.extend(h_findings)
@@ -1605,6 +1613,7 @@ def hunt(ctx, target, preset, ai, modules, output, targets_file,
             ai=ai,
             modules=list(modules) if modules else None,
             auth=auth_creds,
+            browser_auth=browser_auth,
         ))
 
         _stop_printer.set()
@@ -1708,7 +1717,7 @@ def _hunt_single_target(target, preset="standard", ai=False, modules=None,
                         cli_headers=None, cli_token=None, auth_user=None,
                         auth_pass=None, login_user=None, login_pass=None,
                         login_url=None, manual_login=False, fresh_login=False,
-                        verbose=0):
+                        browser_auth=False, verbose=0):
     """
     Run a full hunt on a single target. Used by both single-target and
     multi-target (--file) modes.
@@ -3884,7 +3893,12 @@ def auth_sessions(clear, clear_all):
 @click.argument("file", type=click.Path(exists=True))
 @click.option("--format", "fmt", type=click.Choice(["har", "cookies", "auto"]), default="auto",
               help="File format: har (HTTP Archive JSON), cookies (header string), auto (detect from extension/content)")
-def auth_import_cmd(target, file, fmt):
+@click.option("--idor-slot", "idor_slot", type=click.Choice(["user1", "user2"]), default=None,
+              help="Also write this session into idor.<slot> in ~/.beatrix/auth.yaml, for IDOR "
+                   "dual-account testing. Run the command twice — once per HAR, once per slot — "
+                   "to set up both accounts without touching credentials (works around 2FA, since "
+                   "a HAR captures an already-authenticated session).")
+def auth_import_cmd(target, file, fmt, idor_slot):
     """Import a session from a HAR archive or cookie string file.
 
     \b
@@ -3907,6 +3921,12 @@ def auth_import_cmd(target, file, fmt):
         beatrix auth import example.com session.har
         beatrix auth import api.example.com traffic.har
         beatrix auth import example.com cookies.txt --format cookies
+
+    \b
+    IDOR dual-account setup from two HAR files (no credentials/2FA needed):
+        beatrix auth import example.com account1.har --idor-slot user1
+        beatrix auth import example.com account2.har --idor-slot user2
+        beatrix hunt example.com
     """
     import json as _json
     from pathlib import Path as _Path
@@ -3951,6 +3971,9 @@ def auth_import_cmd(target, file, fmt):
 
     save_session(domain, result)
 
+    if idor_slot:
+        _save_idor_slot(target, idor_slot, result)
+
     # ── Summary table ─────────────────────────────────────────────────────────
     table = Table(title="Imported Session", border_style="green", show_header=False)
     table.add_column("Field", style="bold")
@@ -3964,11 +3987,56 @@ def auth_import_cmd(target, file, fmt):
     if result.token:
         table.add_row("Bearer token", result.token[:40] + "...")
     table.add_row("Method", result.method_used)
+    if idor_slot:
+        table.add_row("IDOR slot", f"idor.{idor_slot} (~/.beatrix/auth.yaml)")
     console.print(table)
     console.print()
-    console.print("[green]Session saved. Run your scan:[/green]")
-    console.print(f"[dim]  beatrix hunt {target}[/dim]")
+    if idor_slot:
+        other = "user2" if idor_slot == "user1" else "user1"
+        console.print(f"[green]Session saved to idor.{idor_slot}.[/green]")
+        console.print(f"[dim]  Import the other account's HAR into idor.{other} the same way, then:[/dim]")
+        console.print(f"[dim]  beatrix hunt {target}[/dim]")
+    else:
+        console.print("[green]Session saved. Run your scan:[/green]")
+        console.print(f"[dim]  beatrix hunt {target}[/dim]")
     console.print()
+
+
+def _save_idor_slot(target: str, slot: str, result: "Any") -> None:
+    """Write an imported HAR/cookie session into idor.<slot> in ~/.beatrix/auth.yaml.
+
+    Merges into the existing file rather than overwriting it — importing
+    user2's HAR must not clobber user1's slot (or vice versa), since these
+    are two separate `auth import` invocations.
+    """
+    import yaml
+    from pathlib import Path
+
+    config_path = Path.home() / ".beatrix" / "auth.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing = {}
+    if config_path.exists():
+        try:
+            existing = yaml.safe_load(config_path.read_text()) or {}
+        except Exception:
+            existing = {}
+
+    idor_cfg = existing.get("idor") or {}
+    existing["idor"] = idor_cfg
+    slot_cfg = idor_cfg.get(slot) or {}
+    idor_cfg[slot] = slot_cfg
+
+    if result.cookies:
+        slot_cfg["cookies"] = dict(result.cookies)
+
+    headers = dict(result.headers) if result.headers else {}
+    if result.token and not any(h.lower() == "authorization" for h in headers):
+        headers["Authorization"] = f"Bearer {result.token}"
+    if headers:
+        slot_cfg["headers"] = headers
+
+    config_path.write_text(yaml.dump(existing, default_flow_style=False, sort_keys=False))
 
 
 def _import_from_har(target: str, file_path) -> "Optional[Any]":

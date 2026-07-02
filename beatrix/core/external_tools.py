@@ -1259,6 +1259,567 @@ class MetasploitRunner(ExternalTool):
 
 
 # =============================================================================
+# RECON TOOLS (continued)
+# =============================================================================
+
+class KiterRunnerRunner(ExternalTool):
+    """
+    Kiterunner — API endpoint discovery via route-aware bruteforcing.
+
+    Uses real-world API route collections (assetnote wordlists) to discover
+    REST and GraphQL endpoints that generic directory busters miss entirely.
+    Understands API path patterns, versioning (/v1/, /v2/), and HTTP methods.
+
+    Install: go install github.com/assetnote/kiterunner/cmd/kr@latest
+    Wordlists: https://wordlists.assetnote.io/ (routes-small.kite, etc.)
+    """
+
+    BINARY_NAME = "kr"
+    DEFAULT_PHASE = 1
+
+    # Default wordlist locations that install.sh places kite files
+    _WORDLIST_PATHS = [
+        str(Path.home() / ".local/share/kiterunner/routes-small.kite"),
+        str(Path.home() / ".local/share/kiterunner/routes-large.kite"),
+        "/usr/share/kiterunner/routes-small.kite",
+    ]
+
+    def _find_wordlist(self) -> Optional[str]:
+        for p in self._WORDLIST_PATHS:
+            if Path(p).exists():
+                return p
+        return None
+
+    async def scan(
+        self,
+        url: str,
+        concurrency: int = 50,
+        timeout: int = 3,
+        fail_status_codes: str = "400,401,404,405,501,502,503",
+    ) -> Dict[str, Any]:
+        """
+        Brute-force API routes against a target.
+
+        Returns:
+            {endpoints: [{url, method, status, length}, ...], total: int}
+        """
+        wordlist = self._find_wordlist()
+        if not wordlist:
+            logging.getLogger("beatrix.tools.kr").warning(
+                "No kiterunner wordlist found — download from wordlists.assetnote.io "
+                "and place at %s", self._WORDLIST_PATHS[0]
+            )
+            return {"endpoints": [], "total": 0}
+
+        outfile = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        outfile.close()
+
+        try:
+            cmd = [
+                self.path,
+                "scan", url,
+                "-w", wordlist,
+                "-x", str(concurrency),
+                "--timeout", str(timeout),
+                "--fail-status-codes", fail_status_codes,
+                "--output", "json",
+                "--output-file", outfile.name,
+                "--kitebuilder-full-scan",
+            ]
+            if not self._verbose_mode:
+                cmd.append("--quiet")
+
+            await self._run(cmd)
+
+            endpoints = []
+            try:
+                with open(outfile.name) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                            endpoints.append({
+                                "url": entry.get("request", {}).get("URL",
+                                        entry.get("URL", url)),
+                                "method": entry.get("request", {}).get("Method",
+                                           entry.get("Method", "GET")),
+                                "status": entry.get("response", {}).get("StatusCode",
+                                           entry.get("StatusCode", 0)),
+                                "length": entry.get("response", {}).get("ContentLength",
+                                           entry.get("ContentLength", 0)),
+                            })
+                        except json.JSONDecodeError:
+                            # Plain-text line: "POST   200 [  1234, 12, 5] https://..."
+                            m = re.match(
+                                r'(\w+)\s+(\d+)\s+\[.*?\]\s+(https?://\S+)', line
+                            )
+                            if m:
+                                endpoints.append({
+                                    "url": m.group(3),
+                                    "method": m.group(1),
+                                    "status": int(m.group(2)),
+                                    "length": 0,
+                                })
+            except FileNotFoundError:
+                pass
+
+            return {"endpoints": endpoints, "total": len(endpoints)}
+        finally:
+            try:
+                os.unlink(outfile.name)
+            except OSError:
+                pass
+
+
+class ArjunRunner(ExternalTool):
+    """
+    Arjun — Hidden HTTP parameter discovery.
+
+    Discovers undocumented GET/POST/JSON parameters by observing response
+    differences. Finds debug flags, hidden admin params, and undocumented
+    API fields that crawlers and manual review miss.
+
+    Install: pip install arjun  (or pipx install arjun)
+    """
+
+    BINARY_NAME = "arjun"
+    DEFAULT_PHASE = 1
+
+    async def discover(
+        self,
+        url: str,
+        method: str = "GET",
+        threads: int = 5,
+        timeout: int = 15,
+    ) -> Dict[str, Any]:
+        """
+        Discover hidden parameters on a URL.
+
+        Returns:
+            {params: ["param1", "param2", ...], url: str, method: str}
+        """
+        outfile = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        outfile.close()
+
+        try:
+            cmd = [
+                self.path,
+                "-u", url,
+                "-m", method.upper(),
+                "-t", str(threads),
+                "--timeout", str(timeout),
+                "-oJ", outfile.name,
+            ]
+            if not self._verbose_mode:
+                cmd.append("-q")
+
+            await self._run(cmd)
+
+            params: List[str] = []
+            try:
+                with open(outfile.name) as f:
+                    data = json.load(f)
+                    # Arjun JSON: {"url": ..., "params": [...]} or list of such objects
+                    if isinstance(data, list):
+                        for entry in data:
+                            params.extend(entry.get("params", []))
+                    elif isinstance(data, dict):
+                        params = data.get("params", [])
+            except (json.JSONDecodeError, FileNotFoundError):
+                pass
+
+            return {"params": sorted(set(params)), "url": url, "method": method}
+        finally:
+            try:
+                os.unlink(outfile.name)
+            except OSError:
+                pass
+
+
+class ClairvoyanceRunner(ExternalTool):
+    """
+    Clairvoyance — GraphQL schema reconstruction despite disabled introspection.
+
+    Recovers the full schema by fuzzing field names against error messages.
+    Essential when the target disables introspection in production (common)
+    but still leaks field names in validation error responses.
+
+    Install: pip install clairvoyance
+    """
+
+    BINARY_NAME = "clairvoyance"
+    DEFAULT_PHASE = 4
+
+    async def reconstruct_schema(
+        self,
+        url: str,
+        output_path: Optional[str] = None,
+        timeout: int = 120,
+    ) -> Dict[str, Any]:
+        """
+        Attempt to reconstruct the GraphQL schema.
+
+        Returns:
+            {schema: str, types: [...], queries: [...], mutations: [...],
+             output_file: str, success: bool}
+        """
+        outfile = output_path or tempfile.mktemp(suffix=".json")
+        _own_outfile = output_path is None
+
+        try:
+            cmd = [
+                self.path,
+                "-o", outfile,
+                url,
+            ]
+
+            output = await self._run(cmd)
+
+            result: Dict[str, Any] = {
+                "schema": "",
+                "types": [],
+                "queries": [],
+                "mutations": [],
+                "output_file": outfile,
+                "success": False,
+                "raw_output": output or "",
+            }
+
+            try:
+                if Path(outfile).exists():
+                    with open(outfile) as f:
+                        schema_data = json.load(f)
+                    result["schema"] = json.dumps(schema_data, indent=2)
+                    result["success"] = bool(schema_data)
+
+                    # Extract type names from schema JSON
+                    types = schema_data.get("data", {}).get("__schema", {}).get("types", [])
+                    for t in types:
+                        name = t.get("name", "")
+                        if name and not name.startswith("__"):
+                            result["types"].append(name)
+                            fields = t.get("fields") or []
+                            for field in fields:
+                                fname = field.get("name", "")
+                                if t.get("name") in ("Query", "query"):
+                                    result["queries"].append(fname)
+                                elif t.get("name") in ("Mutation", "mutation"):
+                                    result["mutations"].append(fname)
+            except (json.JSONDecodeError, FileNotFoundError):
+                # clairvoyance may output SDL text instead of JSON
+                if output and ("type " in output or "query {" in output):
+                    result["schema"] = output
+                    result["success"] = True
+
+            return result
+        finally:
+            if _own_outfile:
+                try:
+                    Path(outfile).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+
+class WaymoreRunner(ExternalTool):
+    """
+    Waymore — exhaustive historical URL discovery beyond what gau covers.
+
+    Fetches URLs from Wayback Machine, AlienVault OTX, URLscan.io, Common
+    Crawl, and VirusTotal simultaneously. Often surfaces forgotten /api/v1/
+    endpoints, legacy admin panels, and old file-upload paths.
+
+    Install: pip install waymore
+    """
+
+    BINARY_NAME = "waymore"
+    DEFAULT_PHASE = 1
+
+    async def fetch_urls(
+        self,
+        domain: str,
+        mode: str = "U",   # U = URLs only (faster), R = also download responses
+        timeout: int = 120,
+    ) -> List[str]:
+        """Return deduplicated list of historical URLs for *domain*."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cmd = [
+                self.path,
+                "-i", domain,
+                "-mode", mode,
+                "-oU", str(Path(tmpdir) / "urls.txt"),
+                "--no-subs",   # avoid scope creep; gau already handles subs
+            ]
+            try:
+                await self._run(cmd, timeout=timeout)
+            except Exception:
+                pass  # waymore exits non-zero even on partial success
+
+            urls: List[str] = []
+            url_file = Path(tmpdir) / "urls.txt"
+            if url_file.exists():
+                for line in url_file.read_text(errors="replace").splitlines():
+                    line = line.strip()
+                    if line.startswith("http"):
+                        urls.append(line)
+            return urls
+
+
+class Nomore403Runner(ExternalTool):
+    """
+    nomore403 — systematic 403 bypass via header manipulation and path tricks.
+
+    Tests every protected URL with:
+    - Header overrides (X-Forwarded-For, X-Original-URL, X-Rewrite-URL, etc.)
+    - HTTP method override (X-HTTP-Method-Override: GET/POST)
+    - Path normalization tricks (/admin/ → /%2fadmin/, /./admin/, //admin/)
+    - Case variation, URL-encoding, double-encoding
+
+    Install: go install github.com/devploit/nomore403@latest
+    """
+
+    BINARY_NAME = "nomore403"
+    DEFAULT_PHASE = 4
+
+    async def bypass(
+        self,
+        url: str,
+        threads: int = 10,
+        timeout: int = 60,
+    ) -> Dict[str, Any]:
+        """
+        Attempt to bypass a 403 on *url*.
+
+        Returns:
+            {bypassed: bool, bypass_url: str, technique: str, status: int,
+             all_attempts: [{url, technique, status}]}
+        """
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False
+        ) as tmpf:
+            outfile = tmpf.name
+
+        try:
+            cmd = [
+                self.path,
+                "--url", url,
+                "--threads", str(threads),
+                "--output", outfile,
+            ]
+            output = await self._run(cmd, timeout=timeout) or ""
+
+            result: Dict[str, Any] = {
+                "bypassed": False,
+                "bypass_url": "",
+                "technique": "",
+                "status": 403,
+                "all_attempts": [],
+            }
+
+            # Parse stdout — nomore403 prints lines like:
+            # [200] <url>  (<technique>)
+            for line in output.splitlines():
+                line = line.strip()
+                parts = line.split()
+                if not parts:
+                    continue
+                # Look for lines with a 2xx status that differs from 403
+                try:
+                    code_part = parts[0].strip("[]")
+                    code = int(code_part)
+                    if len(parts) >= 2:
+                        attempt_url = parts[1]
+                        technique = " ".join(parts[2:]).strip("()")
+                        result["all_attempts"].append({
+                            "url": attempt_url,
+                            "technique": technique,
+                            "status": code,
+                        })
+                        if 200 <= code < 300 and not result["bypassed"]:
+                            result["bypassed"] = True
+                            result["bypass_url"] = attempt_url
+                            result["technique"] = technique
+                            result["status"] = code
+                except (ValueError, IndexError):
+                    pass
+
+            # Also check file output if available
+            try:
+                if Path(outfile).exists():
+                    for line in Path(outfile).read_text(errors="replace").splitlines():
+                        line = line.strip()
+                        if not line or line in [a["url"] for a in result["all_attempts"]]:
+                            continue
+                        parts = line.split()
+                        try:
+                            code = int(parts[0].strip("[]"))
+                            attempt_url = parts[1] if len(parts) > 1 else ""
+                            technique = " ".join(parts[2:]).strip("()")
+                            result["all_attempts"].append({
+                                "url": attempt_url, "technique": technique, "status": code,
+                            })
+                            if 200 <= code < 300 and not result["bypassed"]:
+                                result["bypassed"] = True
+                                result["bypass_url"] = attempt_url
+                                result["technique"] = technique
+                                result["status"] = code
+                        except (ValueError, IndexError):
+                            pass
+            except Exception:
+                pass
+
+            return result
+        finally:
+            try:
+                Path(outfile).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+class CrlfuzzRunner(ExternalTool):
+    """
+    crlfuzz — dedicated CRLF injection / response splitting scanner.
+
+    Beats nuclei's CRLF tag coverage by using a larger payload set and
+    analysing response headers for injected \\r\\n sequences directly.
+    Catches header injection, response splitting, and HTTP smuggling
+    variants that signature-based templates miss.
+
+    Install: go install github.com/dwisiswant0/crlfuzz/cmd/crlfuzz@latest
+    """
+
+    BINARY_NAME = "crlfuzz"
+    DEFAULT_PHASE = 4
+
+    async def scan(
+        self,
+        url: str,
+        concurrency: int = 25,
+        timeout: int = 60,
+    ) -> Dict[str, Any]:
+        """
+        Scan *url* for CRLF injection.
+
+        Returns:
+            {vulnerable: bool, findings: [{url, payload, evidence}]}
+        """
+        cmd = [
+            self.path,
+            "-u", url,
+            "-c", str(concurrency),
+            "-s",   # silent — only print vulnerable URLs
+        ]
+        output = await self._run(cmd, timeout=timeout) or ""
+
+        findings = []
+        for line in output.splitlines():
+            line = line.strip()
+            if line.startswith("http") or "[vuln]" in line.lower():
+                findings.append({
+                    "url": line,
+                    "payload": "",
+                    "evidence": line,
+                })
+
+        return {
+            "vulnerable": bool(findings),
+            "findings": findings,
+            "raw_output": output,
+        }
+
+
+class TlsxRunner(ExternalTool):
+    """
+    tlsx — fast TLS certificate inspection and cipher-suite enumeration.
+
+    Extracts:
+    - Subject / SAN hostnames (feeds into subdomain discovery)
+    - Certificate chain and expiry
+    - Weak cipher suites (RC4, 3DES, export ciphers)
+    - TLS version support (SSLv3, TLSv1.0/1.1 — still live on many targets)
+    - JARM fingerprint (C2 / WAF identification)
+
+    Install: go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest
+    """
+
+    BINARY_NAME = "tlsx"
+    DEFAULT_PHASE = 1
+
+    async def scan(
+        self,
+        host: str,
+        port: int = 443,
+        timeout: int = 30,
+    ) -> Dict[str, Any]:
+        """
+        Run TLS scan against *host*:*port*.
+
+        Returns:
+            {host: str, port: int, san_domains: [...], tls_versions: [...],
+             weak_ciphers: [...], expired: bool, expiry_date: str,
+             jarm: str, raw: str}
+        """
+        cmd = [
+            self.path,
+            "-host", f"{host}:{port}",
+            "-json",
+            "-san",    # include Subject Alternative Names
+            "-tls-version",
+            "-cipher",
+            "-jarm",
+            "-expired",
+            "-so",    # scan-output: stdout only
+        ]
+        output = await self._run(cmd, timeout=timeout) or ""
+
+        result: Dict[str, Any] = {
+            "host": host,
+            "port": port,
+            "san_domains": [],
+            "tls_versions": [],
+            "weak_ciphers": [],
+            "expired": False,
+            "expiry_date": "",
+            "jarm": "",
+            "raw": output,
+        }
+
+        _WEAK_CIPHERS = {
+            "RC4", "3DES", "DES", "NULL", "EXPORT", "anon", "ADH", "AECDH",
+        }
+
+        for line in output.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+                result["tls_versions"] = obj.get("tls_version", []) or []
+                if isinstance(result["tls_versions"], str):
+                    result["tls_versions"] = [result["tls_versions"]]
+
+                ciphers = obj.get("cipher", []) or []
+                if isinstance(ciphers, str):
+                    ciphers = [ciphers]
+                result["weak_ciphers"] = [
+                    c for c in ciphers
+                    if any(w in c.upper() for w in _WEAK_CIPHERS)
+                ]
+
+                sans = obj.get("subject_an", []) or []
+                result["san_domains"] = list(set(sans))
+
+                result["expired"] = bool(obj.get("expired", False))
+                result["expiry_date"] = obj.get("not_after", "") or ""
+                result["jarm"] = obj.get("jarm", "") or ""
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        return result
+
+
+# =============================================================================
 # CONVENIENCE: ALL TOOLS
 # =============================================================================
 
@@ -1281,6 +1842,13 @@ class ExternalToolkit:
         self.whatweb = WhatwebRunner()
         self.webanalyze = WebanalyzeRunner()
         self.dirsearch = DirsearchRunner()
+        self.kiterunner = KiterRunnerRunner()
+        self.arjun = ArjunRunner()
+        self.clairvoyance = ClairvoyanceRunner()
+        self.waymore = WaymoreRunner()
+        self.nomore403 = Nomore403Runner()
+        self.crlfuzz = CrlfuzzRunner()
+        self.tlsx = TlsxRunner()
         self.sqlmap = SqlmapRunner(timeout=300)
         self.dalfox = DalfoxRunner()
         self.commix = CommixRunner()
@@ -1298,6 +1866,13 @@ class ExternalToolkit:
             "whatweb": self.whatweb.available,
             "webanalyze": self.webanalyze.available,
             "dirsearch": self.dirsearch.available,
+            "kiterunner": self.kiterunner.available,
+            "arjun": self.arjun.available,
+            "clairvoyance": self.clairvoyance.available,
+            "waymore": self.waymore.available,
+            "nomore403": self.nomore403.available,
+            "crlfuzz": self.crlfuzz.available,
+            "tlsx": self.tlsx.available,
             "sqlmap": self.sqlmap.available,
             "dalfox": self.dalfox.available,
             "commix": self.commix.available,
