@@ -1149,6 +1149,73 @@ def setup_cmd(ctx, check):
 # HUNT — Main scanning command
 # =============================================================================
 
+def _run_ghost_hunt(target, *, cli_headers=(), cli_cookies=(), cli_token=None, verbose=False):
+    """Run a single-target hunt through the GHOST v2 agent (`beatrix hunt --ghost`).
+
+    Thin wrapper over ``beatrix.ai.ghost2.run_investigation`` that reuses the
+    hunt command's auth options and prints a compact result.
+    """
+    try:
+        from beatrix.ai.ghost2 import GhostV2Config, run_investigation
+    except ImportError:
+        console.print("[red]--ghost requires the 'agent' extra:[/red]")
+        console.print("  [bold]pip install 'beatrix-cli[agent]'[/bold]")
+        sys.exit(1)
+
+    base_headers = {}
+    for h in cli_headers:
+        if ":" in h:
+            name, value = h.split(":", 1)
+            base_headers[name.strip()] = value.strip()
+    if cli_token:
+        base_headers.setdefault("Authorization", f"Bearer {cli_token}")
+    base_cookies = {}
+    for c in cli_cookies:
+        if "=" in c:
+            name, value = c.split("=", 1)
+            base_cookies[name.strip()] = value.strip()
+
+    cfg = GhostV2Config.load()
+    key_hint = cfg.missing_key_message()
+    if key_hint:
+        console.print(f"[red]{key_hint}[/red]")
+        sys.exit(1)
+
+    console.print(Panel.fit(
+        f"[bold]Target:[/bold] {target}\n[bold]Model:[/bold]  {cfg.model}\n"
+        f"[bold]Mode:[/bold]   ghost-driven (GHOST v2)",
+        title="[bold bright_red]👻 GHOST v2[/bold bright_red]", border_style="red",
+    ))
+
+    try:
+        result = asyncio.run(run_investigation(
+            target, cfg=cfg, base_headers=base_headers, base_cookies=base_cookies,
+            console=console, verbose=verbose,
+        ))
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Investigation interrupted.[/yellow]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"\n[red]Error: {e}[/red]")
+        if verbose:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+
+    verdict_color = "red" if result["verdict"] == "VULNERABLE" else "green"
+    console.print(f"\n[bold {verdict_color}]Verdict: {result['verdict']}[/bold {verdict_color}]")
+    if result["findings"]:
+        console.print(f"\n[bold]Findings ({result['num_findings']}):[/bold]")
+        for finding in result["findings"]:
+            console.print(f"  {finding.severity.icon} [{finding.severity.color}]{finding.title}[/{finding.severity.color}]")
+    if result.get("hunt_id"):
+        console.print(f"\n[dim]Saved to findings DB as hunt #{result['hunt_id']} (beatrix findings).[/dim]")
+    if result.get("scan_dir"):
+        console.print(f"[dim]Scan output: {result['scan_dir']}[/dim]")
+    if result.get("final_output"):
+        console.print(Panel(str(result["final_output"]), title="Summary", border_style="dim"))
+
+
 @cli.command()
 @click.argument("target", required=False, default=None)
 @click.option(
@@ -1158,6 +1225,9 @@ def setup_cmd(ctx, check):
     help="Scan preset (run 'beatrix help hunt' for details)"
 )
 @click.option("--ai", is_flag=True, help="Enable AI analysis (Claude Haiku)")
+@click.option("--ghost", is_flag=True,
+              help="Drive the hunt with the GHOST v2 autonomous agent instead of the "
+                   "deterministic pipeline (requires the 'agent' extra). Single target only.")
 @click.option("--modules", "-m", multiple=True, help="Specific modules to run (repeatable)")
 @click.option("--output", "-o", type=click.Path(), help="Output directory")
 @click.option("--file", "-f", "targets_file", type=click.Path(exists=True),
@@ -1191,7 +1261,7 @@ def setup_cmd(ctx, check):
 @click.option("--verbose", "-v", count=True,
               help="Verbosity: -v show all info, -vv show finding details, -vvv enable debug logging")
 @click.pass_context
-def hunt(ctx, target, preset, ai, modules, output, targets_file,
+def hunt(ctx, target, preset, ai, ghost, modules, output, targets_file,
          auth_config, cli_cookies, cli_headers, cli_token, auth_user, auth_pass,
          login_user, login_pass, login_url, manual_login, fresh_login, browser_auth, rate_limit, verbose):
     """
@@ -1201,6 +1271,7 @@ def hunt(ctx, target, preset, ai, modules, output, targets_file,
     Examples:
         beatrix hunt example.com
         beatrix hunt example.com --preset full --ai
+        beatrix hunt example.com --ghost          # autonomous GHOST v2 agent
         beatrix hunt api.example.com -m cors -m idor
         beatrix hunt -f targets.txt
         beatrix hunt -f targets.txt --preset full -o ./reports
@@ -1227,6 +1298,21 @@ def hunt(ctx, target, preset, ai, modules, output, targets_file,
         console.print("[dim]  beatrix hunt example.com[/dim]")
         console.print("[dim]  beatrix hunt -f targets.txt[/dim]")
         sys.exit(1)
+
+    # ── GHOST-driven mode ─────────────────────────────────────────────────
+    # Hand the target to GHOST v2 instead of the deterministic pipeline. The
+    # agent persists findings to the same FindingsDB / scan dir, so `beatrix
+    # findings` and every reporter work identically.
+    if ghost:
+        if len(target_list) > 1:
+            console.print("[red]✗ --ghost runs one target at a time; drop --file or pass a single target.[/red]")
+            sys.exit(1)
+        _run_ghost_hunt(
+            target_list[0],
+            cli_headers=cli_headers, cli_cookies=cli_cookies, cli_token=cli_token,
+            verbose=bool(verbose),
+        )
+        return
 
     # ── Multi-target mode ─────────────────────────────────────────────────
     if len(target_list) > 1:
@@ -4740,11 +4826,22 @@ def validate_findings(ctx, findings_file):
 @click.pass_context
 def ghost(ctx, target, objective, method, header, data, max_turns, model, api_key, bedrock):
     """
-    Launch GHOST autonomous penetration testing agent.
+    Launch GHOST autonomous penetration testing agent (legacy).
+
+    \b
+    DEPRECATED: superseded by `beatrix ghost2` (or `beatrix hunt --ghost`),
+    which runs on openai-agents + LiteLLM with native tool-calling, the full
+    scanner arsenal, a Docker sandbox, subagents, and a grounding knowledge
+    base. This command is kept for now and will be aliased to ghost2 later.
 
     \b
     Run 'beatrix help ghost' for details.
     """
+    console.print(
+        "[yellow]⚠ `beatrix ghost` is deprecated — use `beatrix ghost2` "
+        "(or `beatrix hunt --ghost`) for the rebuilt agent.[/yellow]"
+    )
+
     from beatrix.ai.assistant import AIConfig, AIProvider
     from beatrix.ai.ghost import GhostAgent, PrintCallback
 
@@ -4805,6 +4902,112 @@ def ghost(ctx, target, objective, method, header, data, max_turns, model, api_ke
         import traceback
         traceback.print_exc()
         sys.exit(1)
+
+
+@cli.command("ghost2")
+@click.argument("target")
+@click.option("--objective", "-o", default="Find and validate security vulnerabilities.",
+              help="Investigation objective")
+@click.option("--header", "-H", multiple=True, help='Add base header (format: "Name: Value")')
+@click.option("--model", default=None,
+              help="LiteLLM model string (e.g. openai/gpt-4o, openrouter/anthropic/claude-3.7-sonnet). "
+                   "Defaults to ai.model from config.yaml / BEATRIX_LLM.")
+@click.option("--api-base", default=None, help="Provider API base URL (OpenRouter/Ollama/self-hosted)")
+@click.option("--reasoning", type=click.Choice(["minimal", "low", "medium", "high"]), default=None,
+              help="Reasoning effort (provider-dependent)")
+@click.option("--sandbox", type=click.Choice(["docker", "host", "auto"]), default=None,
+              help="Tool execution runtime: docker sandbox, host, or auto (Docker if available)")
+@click.option("--allow-host-exec", is_flag=True, default=False,
+              help="Permit shell/python_exec on the HOST runtime (unsafe; sandbox is preferred)")
+@click.option("--max-turns", "-t", type=int, default=None, help="Maximum agent turns")
+@click.option("--no-persist", is_flag=True, help="Do not save findings to the findings database")
+@click.option("--verbose", "-v", is_flag=True, help="Show tool results and reasoning")
+@click.pass_context
+def ghost2(ctx, target, objective, header, model, api_base, reasoning, sandbox, allow_host_exec, max_turns, no_persist, verbose):
+    """
+    Launch GHOST v2 — the Strix-style autonomous agent (openai-agents + LiteLLM).
+
+    \b
+    Works with any LLM provider via LiteLLM. Set the model with --model or
+    ai.model in ~/.beatrix/config.yaml, and the key via LLM_API_KEY (or the
+    provider-native env var, e.g. OPENAI_API_KEY / OPENROUTER_API_KEY).
+
+    \b
+    Examples:
+        beatrix ghost2 http://testphp.vulnweb.com/
+        beatrix ghost2 https://api.example.com --model openrouter/anthropic/claude-3.7-sonnet
+    """
+    try:
+        from beatrix.ai.ghost2 import GhostV2Config, run_investigation
+    except ImportError:
+        console.print("[red]GHOST v2 requires the 'agent' extra:[/red]")
+        console.print("  [bold]pip install 'beatrix-cli[agent]'[/bold]")
+        sys.exit(1)
+
+    base_headers = {}
+    for h in header:
+        if ':' in h:
+            name, value = h.split(':', 1)
+            base_headers[name.strip()] = value.strip()
+
+    cfg = GhostV2Config.load(
+        model=model, api_base=api_base, reasoning_effort=reasoning,
+        sandbox=sandbox, allow_host_exec=(allow_host_exec or None), max_turns=max_turns,
+    )
+
+    console.print(Panel.fit(
+        f"[bold]Target:[/bold]    {target}\n"
+        f"[bold]Objective:[/bold] {objective}\n"
+        f"[bold]Model:[/bold]     {cfg.model}\n"
+        f"[bold]Reasoning:[/bold] {cfg.reasoning_effort or 'default'}\n"
+        f"[bold]Sandbox:[/bold]   {cfg.sandbox}"
+        + (" [dim](host exec enabled)[/dim]" if cfg.allow_host_exec else "") + "\n"
+        f"[bold]Max Turns:[/bold] {cfg.max_turns}",
+        title="[bold bright_red]👻 GHOST v2[/bold bright_red]",
+        border_style="red",
+    ))
+
+    key_hint = cfg.missing_key_message()
+    if key_hint:
+        console.print(f"[red]{key_hint}[/red]")
+        sys.exit(1)
+
+    try:
+        result = asyncio.run(run_investigation(
+            target, cfg=cfg, objective=objective, base_headers=base_headers,
+            console=console, verbose=verbose, persist=not no_persist,
+        ))
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Investigation interrupted.[/yellow]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"\n[red]Error: {e}[/red]")
+        if verbose:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+
+    if result.get("hit_turn_limit"):
+        console.print(
+            f"\n[yellow]Reached the {cfg.max_turns}-turn budget before the agent "
+            "called finish_scan; results below are what it gathered. "
+            "Raise --max-turns for a longer run.[/yellow]"
+        )
+
+    verdict_color = "red" if result["verdict"] == "VULNERABLE" else "green"
+    console.print(f"\n[bold {verdict_color}]Verdict: {result['verdict']}[/bold {verdict_color}]")
+    console.print(
+        f"[dim]Turns budget: {cfg.max_turns} | modules used: "
+        f"{', '.join(result['modules_run']) or 'none'} | {result['duration_secs']}s[/dim]"
+    )
+    if result["findings"]:
+        console.print(f"\n[bold]Findings ({result['num_findings']}):[/bold]")
+        for finding in result["findings"]:
+            console.print(f"  {finding.severity.icon} [{finding.severity.color}]{finding.title}[/{finding.severity.color}]")
+    if result.get("hunt_id"):
+        console.print(f"\n[dim]Saved to findings DB as hunt #{result['hunt_id']} (beatrix findings).[/dim]")
+    if result.get("final_output"):
+        console.print(Panel(str(result["final_output"]), title="Summary", border_style="dim"))
 
 
 # =============================================================================

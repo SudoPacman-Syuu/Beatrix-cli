@@ -13,15 +13,12 @@ Architecture:
 
 from .assistant import AIAssistant, AIConfig, HaikuGrunt, validate_credentials
 from .ghost import GhostAgent, GhostCallback, GhostFinding, PrintCallback
-from .tasks import Task, TaskPriority, TaskRouter
 
 __all__ = [
     "AIAssistant",
     "HaikuGrunt",
     "AIConfig",
-    "TaskRouter",
-    "Task",
-    "TaskPriority",
+    "validate_credentials",
     "GhostAgent",
     "GhostCallback",
     "PrintCallback",
