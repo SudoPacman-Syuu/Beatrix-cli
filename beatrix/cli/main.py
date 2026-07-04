@@ -759,6 +759,13 @@ def cli(ctx, quiet):
     ctx.ensure_object(dict)
     ctx.obj["quiet"] = quiet
 
+    # Load GUI-saved AI keys from ~/.beatrix/.env (real env vars still win).
+    try:
+        from beatrix.cli.auth_gui import load_beatrix_env
+        load_beatrix_env()
+    except Exception:
+        pass
+
     if not quiet and ctx.invoked_subcommand is None:
         print_banner()
         _show_quick_reference()
@@ -3352,12 +3359,34 @@ def auth_group(ctx):
     IDOR gets user sessions, crawler gets cookies for authenticated crawling.
 
     Examples:
-        beatrix auth login         # Interactive credential setup wizard
-        beatrix auth show          # Show current auth state
-        beatrix auth init          # Generate sample auth config file
+        beatrix auth              # Open the drag-and-drop auth GUI in your browser
+        beatrix auth login        # Interactive credential setup wizard
+        beatrix auth show         # Show current auth state
+        beatrix auth init         # Generate sample auth config file
     """
+    # Bare `beatrix auth` launches the browser GUI — no YAML editing required.
     if ctx.invoked_subcommand is None:
-        click.echo(ctx.get_help())
+        ctx.invoke(auth_gui)
+
+
+@auth_group.command("gui")
+@click.option("--port", type=int, default=8765, help="Port to serve the GUI on (default: 8765)")
+@click.option("--host", default="127.0.0.1", help="Interface to bind (default: 127.0.0.1)")
+@click.option("--no-browser", is_flag=True, help="Don't try to open a browser automatically")
+def auth_gui(port, host, no_browser):
+    """Open a browser GUI to set up auth — drag-drop a HAR or paste cookies.
+
+    \b
+    Works in Codespaces / remote containers: starts a localhost web server that
+    VS Code port-forwards to a browser tab. No YAML editing, no native window.
+    Saves through the same path as `beatrix auth import`.
+    """
+    from beatrix.cli.auth_gui import serve_auth_gui
+    try:
+        serve_auth_gui(host=host, port=port, open_browser=not no_browser)
+    except OSError as e:
+        console.print(f"[red]Could not start GUI on {host}:{port} — {e}[/red]")
+        console.print(f"[dim]Try a different port: beatrix auth gui --port 8899[/dim]")
 
 
 @auth_group.command("init")
@@ -4921,9 +4950,12 @@ def ghost(ctx, target, objective, method, header, data, max_turns, model, api_ke
               help="Permit shell/python_exec on the HOST runtime (unsafe; sandbox is preferred)")
 @click.option("--max-turns", "-t", type=int, default=None, help="Maximum agent turns")
 @click.option("--no-persist", is_flag=True, help="Do not save findings to the findings database")
+@click.option("--no-auth", is_flag=True, help="Do not auto-load saved auth (auth.yaml / sessions)")
+@click.option("--no-web", is_flag=True, help="Disable the live browser dashboard (on by default)")
+@click.option("--web-port", type=int, default=8799, help="Port for the live dashboard (default: 8799)")
 @click.option("--verbose", "-v", is_flag=True, help="Show tool results and reasoning")
 @click.pass_context
-def ghost2(ctx, target, objective, header, model, api_base, reasoning, sandbox, allow_host_exec, max_turns, no_persist, verbose):
+def ghost2(ctx, target, objective, header, model, api_base, reasoning, sandbox, allow_host_exec, max_turns, no_persist, no_auth, no_web, web_port, verbose):
     """
     Launch GHOST v2 — the Strix-style autonomous agent (openai-agents + LiteLLM).
 
@@ -4950,6 +4982,47 @@ def ghost2(ctx, target, objective, header, model, api_base, reasoning, sandbox, 
             name, value = h.split(':', 1)
             base_headers[name.strip()] = value.strip()
 
+    # ── Auto-load saved auth so the agent runs authenticated ──────────────
+    # Only credentials that belong to THIS target's domain are attached — never
+    # cross-domain (IDOR slots carry no domain and are deliberately NOT used as
+    # base auth, so airbnb cookies can't leak to another host). Sources: the
+    # per-target/global block of ~/.beatrix/auth.yaml plus a domain-matched
+    # saved session (HAR/cookie import or the `beatrix auth` GUI). -H wins.
+    base_cookies: dict = {}
+    auth_status = "none"
+    if not no_auth:
+        try:
+            from beatrix.core.auth_config import AuthConfigLoader
+            from urllib.parse import urlparse as _up
+            import json as _json
+            from pathlib import Path as _P
+
+            creds = AuthConfigLoader.load(target=target)
+            if creds.cookies or creds.merged_headers():
+                base_cookies.update(creds.cookies or {})
+                for k, v in creds.merged_headers().items():
+                    base_headers.setdefault(k, v)
+                auth_status = "auth.yaml"
+
+            # Domain-scoped saved session, matching apex/www variants only.
+            host = (_up(target if "://" in target else f"https://{target}").netloc
+                    or target).split(":")[0]
+            variants = [host, host[4:] if host.startswith("www.") else "www." + host]
+            sess_dir = _P.home() / ".beatrix" / "sessions"
+            for cand in variants:
+                sf = sess_dir / (cand.replace(":", "_").replace("/", "_") + ".json")
+                if sf.exists():
+                    data = _json.loads(sf.read_text())
+                    base_cookies.update(data.get("cookies") or {})
+                    for k, v in (data.get("headers") or {}).items():
+                        base_headers.setdefault(k, v)
+                    if data.get("token"):
+                        base_headers.setdefault("Authorization", f"Bearer {data['token']}")
+                    auth_status = f"session:{cand}"
+                    break
+        except Exception as e:  # noqa: BLE001 — auth is best-effort, never fatal
+            console.print(f"[yellow]auth: could not load saved credentials ({e})[/yellow]")
+
     cfg = GhostV2Config.load(
         model=model, api_base=api_base, reasoning_effort=reasoning,
         sandbox=sandbox, allow_host_exec=(allow_host_exec or None), max_turns=max_turns,
@@ -4962,6 +5035,9 @@ def ghost2(ctx, target, objective, header, model, api_base, reasoning, sandbox, 
         f"[bold]Reasoning:[/bold] {cfg.reasoning_effort or 'default'}\n"
         f"[bold]Sandbox:[/bold]   {cfg.sandbox}"
         + (" [dim](host exec enabled)[/dim]" if cfg.allow_host_exec else "") + "\n"
+        f"[bold]Auth:[/bold]      "
+        + (f"{auth_status} ({len(base_cookies)} cookies, {len(base_headers)} headers)"
+           if auth_status != "none" else "none") + "\n"
         f"[bold]Max Turns:[/bold] {cfg.max_turns}",
         title="[bold bright_red]👻 GHOST v2[/bold bright_red]",
         border_style="red",
@@ -4972,19 +5048,43 @@ def ghost2(ctx, target, objective, header, model, api_base, reasoning, sandbox, 
         console.print(f"[red]{key_hint}[/red]")
         sys.exit(1)
 
+    # ── Live web dashboard (on by default; --no-web to disable) ───────────
+    web_server = None
+    on_event = None
+    if not no_web:
+        try:
+            from beatrix.cli.ghost_web import GhostWebServer
+            web_server = GhostWebServer(
+                meta={"target": target, "model": cfg.model,
+                      "auth": auth_status, "objective": objective},
+                port=web_port,
+            )
+            web_server.start(open_browser=True)
+            on_event = web_server.emit
+            console.print(f"[green]📺 Live dashboard:[/green] {web_server.url}")
+            if web_server.public_url:
+                console.print(f"[green]   Codespaces:[/green] {web_server.public_url}")
+        except Exception as e:  # noqa: BLE001 — dashboard is optional, never fatal
+            console.print(f"[yellow]Could not start --web dashboard: {e}[/yellow]")
+
     try:
         result = asyncio.run(run_investigation(
             target, cfg=cfg, objective=objective, base_headers=base_headers,
-            console=console, verbose=verbose, persist=not no_persist,
+            base_cookies=base_cookies, console=console, verbose=verbose,
+            persist=not no_persist, on_event=on_event,
         ))
     except KeyboardInterrupt:
         console.print("\n[yellow]Investigation interrupted.[/yellow]")
+        if web_server:
+            web_server.stop()
         sys.exit(1)
     except Exception as e:
         console.print(f"\n[red]Error: {e}[/red]")
         if verbose:
             import traceback
             traceback.print_exc()
+        if web_server:
+            web_server.stop()
         sys.exit(1)
 
     if result.get("hit_turn_limit"):
@@ -5008,6 +5108,22 @@ def ghost2(ctx, target, objective, header, model, api_base, reasoning, sandbox, 
         console.print(f"\n[dim]Saved to findings DB as hunt #{result['hunt_id']} (beatrix findings).[/dim]")
     if result.get("final_output"):
         console.print(Panel(str(result["final_output"]), title="Summary", border_style="dim"))
+
+    # Keep the live dashboard up after the run so the user can scroll back — but
+    # only when attached to a real terminal. If output is redirected or piped
+    # (e.g. `ghost2 ... > out.txt`, CI), don't block: stop and let the command
+    # return so scripts complete.
+    if web_server:
+        web_server.finish(result)
+        interactive = sys.stdout.isatty() or sys.stderr.isatty()
+        if interactive:
+            console.print(
+                f"\n[green]📺 Dashboard still live at {web_server.url}[/green] "
+                "[dim](Ctrl-C to close)[/dim]"
+            )
+            web_server.wait()
+        else:
+            web_server.stop()
 
 
 # =============================================================================

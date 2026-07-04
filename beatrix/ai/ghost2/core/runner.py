@@ -26,6 +26,7 @@ async def run_investigation(
     console: Any = None,
     verbose: bool = False,
     persist: bool = True,
+    on_event: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Run a full GHOST v2 investigation against ``target``.
 
@@ -41,6 +42,14 @@ async def run_investigation(
 
     from agents import Runner  # lazy: only when actually running an investigation
 
+    # Disable openai-agents' OpenAI-bound trace export — it's irrelevant when
+    # running through LiteLLM/OpenRouter and otherwise logs a warning per turn.
+    try:
+        from agents import set_tracing_disabled
+        set_tracing_disabled(True)
+    except Exception:
+        pass
+
     from ..agents.factory import build_root_agent
 
     from ..runtime.dispatch import make_runtime
@@ -52,7 +61,7 @@ async def run_investigation(
         base_cookies=base_cookies or {},
     )
     runtime = make_runtime(cfg, console=console)
-    hooks = GhostHooks(console=console, verbose=verbose)
+    hooks = GhostHooks(console=console, verbose=verbose, on_event=on_event)
     session = GhostSession(scope, runtime=runtime)
     # Run-scoped services the graph tools and OOB tools read off the session.
     session.cfg = cfg
