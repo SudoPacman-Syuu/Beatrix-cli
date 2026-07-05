@@ -25,5 +25,9 @@ to an attacker-chosen site. Impact is usually Low on its own but can chain
 - The parameter reflected but no actual redirect occurs.
 - A redirect the browser performs to a host on the site's own allowlist.
 
+*Enforced by code:* `record_finding` runs this through `ImpactValidator`'s
+`not_info_noise` and `evidence_exists` checks — a same-origin/self redirect
+reported as a standalone high-severity finding will be flagged.
+
 ## Severity
 Low/Info alone; Medium/High when chained into token theft or SSRF.

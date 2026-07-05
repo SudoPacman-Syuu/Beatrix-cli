@@ -26,6 +26,10 @@ letting an attacker place executable or malicious content.
 - Validation that rejects your payload extension/type.
 - An uploaded file you can't locate or retrieve — no demonstrated impact.
 
+*Enforced by code:* `record_finding` runs this through `ImpactValidator`'s
+`evidence_exists`/`reproducible` checks — an accepted upload with no
+demonstrated execution/retrieval will be flagged.
+
 ## Severity
 Critical for code execution; High/Medium for stored XSS or traversal via
 upload, scoped to the demonstrated effect.

@@ -13,9 +13,16 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from beatrix.core.types import Finding
+
+# Lightweight bounds on scratch state that would otherwise grow unbounded for
+# the life of a run (long investigations can rack up hundreds of turns).
+# Findings are never capped — they're the actual deliverable.
+_MAX_RESPONSES = 50
+_MAX_NOTES = 30
+_MAX_DONE_TODOS = 10
 
 
 @dataclass
@@ -91,8 +98,12 @@ class GhostSession:
         self._responses: Dict[int, StoredResponse] = {}
         self._response_counter = 0
 
-        # Findings buffer (persisted to FindingsDB at finalize)
+        # Findings buffer (persisted to FindingsDB at finalize). Root agent
+        # and subagents (recon/exploitation/validation) often run the same
+        # scanner independently over the same target — dedup by (title, url)
+        # so that doesn't double every finding in the final report.
         self.findings: List[Finding] = []
+        self._finding_keys: Set[Tuple[str, str]] = set()
 
         # Agent scratch state
         self.notes: List[str] = []
@@ -128,6 +139,9 @@ class GhostSession:
                 method=method,
             )
             self._responses[rid] = resp
+            if len(self._responses) > _MAX_RESPONSES:
+                for old_id in sorted(self._responses)[: len(self._responses) - _MAX_RESPONSES]:
+                    del self._responses[old_id]
         self._emit("stored_response", str(rid), status_code)
         return resp
 
@@ -140,15 +154,28 @@ class GhostSession:
         return self._responses[max(self._responses)]
 
     # ── Findings ────────────────────────────────────────────────────────
-    async def add_finding(self, finding: Finding) -> None:
+    async def add_finding(self, finding: Finding) -> bool:
+        """Buffer a finding, skipping exact (title, url) duplicates.
+
+        Returns False if this was a duplicate of an already-recorded finding
+        (root agent + subagents can independently re-run the same scanner
+        over the same target); True if it was newly added.
+        """
+        key = (finding.title, finding.url)
         async with self._lock:
+            if key in self._finding_keys:
+                return False
+            self._finding_keys.add(key)
             self.findings.append(finding)
         self._emit("finding", finding.title, finding.severity.value)
+        return True
 
     # ── Scratch state ───────────────────────────────────────────────────
     async def add_note(self, text: str) -> None:
         async with self._lock:
             self.notes.append(text)
+            if len(self.notes) > _MAX_NOTES:
+                del self.notes[: len(self.notes) - _MAX_NOTES]
 
     async def add_todo(self, text: str) -> int:
         async with self._lock:
@@ -159,11 +186,26 @@ class GhostSession:
 
     async def complete_todo(self, tid: int) -> bool:
         async with self._lock:
+            found = False
             for t in self.todos:
                 if t["id"] == tid:
                     t["done"] = True
-                    return True
-        return False
+                    found = True
+                    break
+            if found:
+                self._prune_done_todos()
+            return found
+
+    def _prune_done_todos(self) -> None:
+        """Drop the oldest completed todos beyond the cap; never touch in-flight ones.
+
+        Caller must hold ``self._lock``.
+        """
+        done = [t for t in self.todos if t["done"]]
+        if len(done) <= _MAX_DONE_TODOS:
+            return
+        drop_ids = {t["id"] for t in done[: len(done) - _MAX_DONE_TODOS]}
+        self.todos = [t for t in self.todos if t["id"] not in drop_ids]
 
     def record_module(self, name: str) -> None:
         self.modules_run.add(name)

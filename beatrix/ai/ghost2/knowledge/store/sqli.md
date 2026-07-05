@@ -29,6 +29,17 @@ attacker alter the query's structure.
   requests (slow endpoint, network jitter). Repeat before believing.
 - WAF block pages (403/406) — that's the WAF reacting, not the DB.
 - Reflected payload in an error message without query-structure control.
+- **Behavioral/fingerprint divergence on a WAF or bot-protection endpoint**
+  (captcha, challenge, PerimeterX, DataDome, Cloudflare `/cdn-cgi/`,
+  Turnstile). These systems are *designed* to respond differently to
+  malicious-looking input — a fingerprint difference there is the WAF doing
+  its job, not the database reacting. Only error-based or data-extraction
+  proof counts on these endpoints.
+
+*Enforced by code:* `record_finding` runs this through `ImpactValidator`'s
+`behavioral_sqli_waf` check (auto-kills behavioral-only findings on known
+WAF/challenge paths) and `error_only` (kills a bare DB error with no
+actionable leaked data).
 
 ## Severity
 Critical when it yields data extraction or auth bypass; High for confirmed

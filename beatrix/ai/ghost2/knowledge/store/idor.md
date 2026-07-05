@@ -26,6 +26,15 @@ caller is authorized** for that object.
 - A 200 with an empty/placeholder body for another id — no sensitive data
   disclosed.
 - Guessable ids alone. Predictability is not a vuln without missing authZ.
+- Non-guessable identifiers (a booking reference, an opaque per-object token)
+  swapped only because you already had both values. If the target requires an
+  auth token/id an attacker can't reasonably obtain, you must show how they'd
+  get it (enumeration, prediction, leak elsewhere) — not just that swapping it
+  works once you already have both.
+
+*Enforced by code:* `record_finding` runs this through `ImpactValidator` —
+`evidence_exists`, `reproducible`, and `auth_required` will flag or reject a
+claim that doesn't clear this bar.
 
 ## Severity
 High to Critical depending on data sensitivity and whether it's read-only or

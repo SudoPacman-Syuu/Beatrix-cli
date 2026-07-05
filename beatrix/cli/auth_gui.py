@@ -95,7 +95,13 @@ _PAGE = r"""<!doctype html>
   #msg.ok, #keyMsg.ok { display: block; background: var(--ok)22; border: 1px solid var(--ok); }
   #msg.err, #keyMsg.err { display: block; background: var(--err)22; border: 1px solid var(--err); }
   #msg pre { margin: 8px 0 0; white-space: pre-wrap; font-size: 13px; color: var(--muted); }
-  #keyMsg { margin-top: 12px; padding: 10px 12px; border-radius: 8px; display: none; font-size: 14px; }
+  #keyMsg, #modelMsg { margin-top: 12px; padding: 10px 12px; border-radius: 8px; display: none; font-size: 14px; }
+  #modelMsg.ok { display:block; background: var(--ok)22; border:1px solid var(--ok); }
+  #modelMsg.err { display:block; background: var(--err)22; border:1px solid var(--err); }
+  select { width:100%; background:var(--bg); color:var(--fg); border:1px solid var(--border);
+    border-radius:8px; padding:10px 12px; font:inherit; font-size:14px; }
+  select:focus { outline:2px solid var(--accent); border-color:var(--accent); }
+  #curModel.set { color: var(--ok); font-weight:600; }
   .keyrow { margin-bottom: 14px; }
   .keyrow .cur { font-size: 12px; color: var(--muted); margin-left: 8px; font-family: ui-monospace, monospace; }
   .keyrow .cur.set { color: var(--ok); }
@@ -168,6 +174,31 @@ _PAGE = r"""<!doctype html>
     <div id="keyFields"></div>
     <button class="save" id="saveKeys">Save API keys</button>
     <div id="keyMsg"></div>
+  </div>
+
+  <h1 style="margin-top:36px">🧠 AI model</h1>
+  <p class="sub">Which model <code>ghost2</code> uses. The dropdown lists only <b>free, tool-capable</b> OpenRouter models — ghost2 needs tool-calling, so models without it are hidden.</p>
+  <div class="card">
+    <div class="row">
+      <label>Current: <span class="hint" id="curModel">loading…</span></label>
+      <select id="modelSelect"><option value="">— loading free OpenRouter models… —</option></select>
+    </div>
+    <div class="row">
+      <label for="modelText" style="font-weight:500">…or paste any LiteLLM model string</label>
+      <input type="text" id="modelText" placeholder="openrouter/cohere/north-mini-code:free" autocomplete="off">
+    </div>
+    <div class="row">
+      <label style="font-weight:500">Reasoning effort <span class="hint">— if the model supports it</span></label>
+      <div class="seg" id="reasoning">
+        <button data-r="" class="on">default</button>
+        <button data-r="minimal">minimal</button>
+        <button data-r="low">low</button>
+        <button data-r="medium">medium</button>
+        <button data-r="high">high</button>
+      </div>
+    </div>
+    <button class="save" id="saveModel">Save model</button>
+    <div id="modelMsg"></div>
   </div>
 
   <h1 style="margin-top:36px">🗂️ Currently saved auth</h1>
@@ -258,6 +289,49 @@ saveKeys.onclick = async () => {
   } finally { saveKeys.disabled = false; saveKeys.textContent = "Save API keys"; }
 };
 
+// ── AI model ────────────────────────────────────────────────────────────────
+let reasoning = "";
+document.querySelectorAll("#reasoning button").forEach(b => b.onclick = () => {
+  document.querySelectorAll("#reasoning button").forEach(x => x.classList.remove("on"));
+  b.classList.add("on"); reasoning = b.dataset.r;
+});
+async function loadModel() {
+  const m = await (await fetch("/api/model")).json();
+  const cur = document.getElementById("curModel");
+  cur.textContent = m.model || "not set"; if (m.model) cur.classList.add("set");
+  document.getElementById("modelText").value = m.model || "";
+  reasoning = m.reasoning || "";
+  document.querySelectorAll("#reasoning button").forEach(x =>
+    x.classList.toggle("on", x.dataset.r === reasoning));
+}
+async function loadModels() {
+  const sel = document.getElementById("modelSelect");
+  let data;
+  try { data = await (await fetch("/api/models")).json(); }
+  catch (e) { sel.innerHTML = '<option value="">(could not reach OpenRouter)</option>'; return; }
+  if (!data.ok || !data.models.length) {
+    sel.innerHTML = `<option value="">(${esc(data.error||"no free tool-capable models found")})</option>`;
+    return;
+  }
+  const cur = document.getElementById("modelText").value;
+  sel.innerHTML = '<option value="">— ' + data.models.length + ' free tool-capable models —</option>'
+    + data.models.map(m => `<option value="${esc(m.id)}" ${m.id===cur?"selected":""}>${esc(m.name)}${m.ctx?" · "+Math.round(m.ctx/1000)+"k":""}</option>`).join("");
+  sel.onchange = () => { if (sel.value) document.getElementById("modelText").value = sel.value; };
+}
+const modelMsg = document.getElementById("modelMsg"), saveModel = document.getElementById("saveModel");
+saveModel.onclick = async () => {
+  const model = document.getElementById("modelText").value.trim();
+  if (!model) { modelMsg.className="err"; modelMsg.textContent="Pick a model or paste a model string."; return; }
+  saveModel.disabled = true; saveModel.textContent = "Saving…";
+  try {
+    const data = await (await fetch("/api/model", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({model, reasoning})})).json();
+    modelMsg.className = data.ok ? "ok" : "err";
+    modelMsg.textContent = data.ok ? data.summary : (data.error || "Failed.");
+    if (data.ok) loadModel();
+  } finally { saveModel.disabled = false; saveModel.textContent = "Save model"; }
+};
+
 // ── Existing saved auth ─────────────────────────────────────────────────────
 async function loadExisting() {
   const data = await (await fetch("/api/list")).json();
@@ -289,6 +363,8 @@ async function loadExisting() {
 }
 
 loadKeys();
+loadModel();
+loadModels();
 loadExisting();
 </script>
 </body>
@@ -437,6 +513,91 @@ def _save_keys(payload: dict) -> dict:
     if not changed:
         return {"ok": True, "summary": "No changes — leave a field blank to keep its value."}
     return {"ok": True, "summary": f"✓ Saved to {_ENV_FILE} ({', '.join(changed)})."}
+
+
+_CONFIG_FILE = Path.home() / ".beatrix" / "config.yaml"
+
+
+def _read_config() -> dict:
+    if _CONFIG_FILE.exists():
+        try:
+            import yaml
+            return yaml.safe_load(_CONFIG_FILE.read_text()) or {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _get_model_settings() -> dict:
+    """Current ghost2 model settings from config.yaml."""
+    ai = _read_config().get("ai") or {}
+    return {
+        "ok": True,
+        "model": ai.get("model") or "",
+        "reasoning": ai.get("reasoning_effort") or "",
+        "api_base": ai.get("api_base") or "",
+        "path": str(_CONFIG_FILE),
+    }
+
+
+def _save_model_settings(payload: dict) -> dict:
+    """Write the model / reasoning / api_base into the ai block of config.yaml,
+    preserving every other key. API keys are never touched here."""
+    import yaml
+    cfg = _read_config()
+    ai = dict(cfg.get("ai") or {})
+
+    model = (payload.get("model") or "").strip()
+    if not model:
+        return {"ok": False, "error": "Model string is empty."}
+    ai["model"] = model
+
+    reasoning = (payload.get("reasoning") or "").strip()
+    if reasoning:
+        ai["reasoning_effort"] = reasoning
+    else:
+        ai.pop("reasoning_effort", None)
+
+    api_base = (payload.get("api_base") or "").strip()
+    if api_base:
+        ai["api_base"] = api_base
+    else:
+        ai.pop("api_base", None)
+
+    cfg["ai"] = ai
+    _CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _CONFIG_FILE.write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False))
+    return {"ok": True, "summary": f"✓ Model set to {model}."}
+
+
+def _list_openrouter_models() -> dict:
+    """Free OpenRouter models that support tool-calling (required by ghost2).
+
+    Fetched server-side (no browser CORS issues); best-effort — returns an empty
+    list with an error message if OpenRouter is unreachable.
+    """
+    import urllib.request
+    try:
+        with urllib.request.urlopen("https://openrouter.ai/api/v1/models", timeout=12) as r:
+            data = json.loads(r.read())
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"Could not reach OpenRouter: {e}", "models": []}
+
+    models = []
+    for m in data.get("data", []):
+        mid = m.get("id", "")
+        sp = m.get("supported_parameters", []) or []
+        pricing = m.get("pricing", {}) or {}
+        is_free = mid.endswith(":free") or (
+            pricing.get("prompt") == "0" and pricing.get("completion") == "0")
+        if is_free and "tools" in sp:
+            models.append({
+                "id": f"openrouter/{mid}",
+                "name": m.get("name", mid),
+                "ctx": m.get("context_length"),
+            })
+    models.sort(key=lambda x: x["name"].lower())
+    return {"ok": True, "models": models}
 
 
 def _list_auth() -> dict:
@@ -598,9 +759,14 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             self._send(200, _PAGE.encode("utf-8"), "text/html; charset=utf-8")
-        elif self.path in ("/api/list", "/api/keys"):
+        elif self.path in ("/api/list", "/api/keys", "/api/model", "/api/models"):
             try:
-                result = _list_auth() if self.path == "/api/list" else _list_keys()
+                result = {
+                    "/api/list": _list_auth,
+                    "/api/keys": _list_keys,
+                    "/api/model": _get_model_settings,
+                    "/api/models": _list_openrouter_models,
+                }[self.path]()
             except Exception as e:  # noqa: BLE001
                 result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
             self._send(200, json.dumps(result).encode("utf-8"), "application/json")
@@ -609,7 +775,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         routes = {"/api/save": _build_and_save, "/api/clear": _clear_auth,
-                  "/api/keys": _save_keys}
+                  "/api/keys": _save_keys, "/api/model": _save_model_settings}
         handler = routes.get(self.path)
         if handler is None:
             self._send(404, b"not found", "text/plain")

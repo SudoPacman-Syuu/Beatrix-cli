@@ -23,6 +23,10 @@ enabling object injection and often RCE.
 - A parse error from a corrupted blob (rejection), with no callback.
 - Base64 that merely *looks* serialized but is plain JSON/text.
 
+*Enforced by code:* `record_finding` runs this through `ImpactValidator`'s
+`evidence_exists`/`reproducible` checks — recognizing a serialized format
+without an OOB callback or execution proof will be flagged.
+
 ## Severity
 Critical on confirmed code execution; do not report as high without an OOB
 callback or equivalent execution proof.

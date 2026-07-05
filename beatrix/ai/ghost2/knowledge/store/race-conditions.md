@@ -25,6 +25,10 @@ bypass, duplicate account actions.
   dedup) — verify the final persisted state.
 - Timing variance mistaken for a race without a demonstrated limit breach.
 
+*Enforced by code:* `record_finding` runs this through `ImpactValidator`'s
+`evidence_exists`/`reproducible` checks — a claimed race without a shown,
+reproduced final-state breach will be flagged.
+
 ## Severity
 High to Critical for financial / integrity impact (double-spend, limit bypass);
 requires a clear, reproduced breach of a per-operation limit.

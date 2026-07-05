@@ -27,6 +27,10 @@ user reaches admin functionality, or an endpoint trusts a client-supplied role.
 - Finding an admin link in the UI/JS without showing the endpoint itself is
   unprotected.
 
+*Enforced by code:* `record_finding` runs this through `ImpactValidator`'s
+`auth_required` and `evidence_exists`/`reproducible` checks — a claim without
+a proven successful privileged action will be flagged.
+
 ## Severity
 High to Critical depending on the exposed function (data exfiltration, account
 takeover, destructive actions).

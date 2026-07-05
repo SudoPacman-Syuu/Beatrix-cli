@@ -24,6 +24,10 @@ letting an attacker read (or include) files outside it.
 - Reading a file you were already authorized to read (no boundary crossed).
 - A generic "file not found" for `../` input — filtering is working.
 
+*Enforced by code:* `record_finding` runs this through `ImpactValidator`'s
+`evidence_exists`/`reproducible` checks — a claim with no returned file
+content or execution proof will be flagged.
+
 ## Severity
 High to Critical: source/secret disclosure or a path to code execution;
 scoped by what you can actually read.

@@ -30,6 +30,10 @@ or skip authentication — including JWT flaws and OAuth misconfigurations.
 - `redirect_uri` values that are validated against an allowlist.
 - Short token lifetime treated as a bug; it's usually a control.
 
+*Enforced by code:* `record_finding` runs this through `ImpactValidator`'s
+`auth_required` and `evidence_exists`/`reproducible` checks — a claim of
+bypass without a forged token that's actually accepted will be flagged.
+
 ## Severity
 Critical for full authentication bypass / account takeover; cookie-flag and
 hardening gaps are Low/Info on their own.

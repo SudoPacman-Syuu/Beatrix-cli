@@ -25,6 +25,10 @@ set fields they shouldn't control (`role`, `is_admin`, `balance`, `verified`,
   it (reflect ≠ store — re-read on a fresh request).
 - Setting a non-sensitive field (display name, timezone).
 
+*Enforced by code:* `record_finding` runs this through `ImpactValidator`'s
+`evidence_exists`/`reproducible` checks — an accepted field with no re-read
+proof of persistence will be flagged.
+
 ## Severity
 High to Critical when it grants privilege escalation or financial impact;
 otherwise scoped to the affected field's sensitivity.

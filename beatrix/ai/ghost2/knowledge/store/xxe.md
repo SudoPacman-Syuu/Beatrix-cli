@@ -26,6 +26,10 @@ file disclosure, SSRF, or (rarely) RCE.
   resolved.
 - Callbacks that come from your own tooling rather than the target parser.
 
+*Enforced by code:* `record_finding` runs this through `ImpactValidator`'s
+`error_only` and `evidence_exists`/`reproducible` checks — a parse error with
+no leaked file content or OOB callback will be flagged.
+
 ## Severity
 High to Critical: local file read of sensitive files, or SSRF to internal
 services / cloud metadata.

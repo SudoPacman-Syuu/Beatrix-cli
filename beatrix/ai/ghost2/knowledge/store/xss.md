@@ -27,6 +27,15 @@ script in a victim's browser (reflected, stored, or DOM-based).
 - A strict CSP (`script-src 'self'` with no unsafe-inline/JSONP) that blocks
   inline execution — downgrade unless you find a CSP bypass.
 - Self-XSS requiring the victim to paste a payload into their own console.
+- **DOM XSS from a source→sink pattern match with no confirmed execution.**
+  `location`/`document.referrer` reaching `innerHTML`/`eval` exists in almost
+  every modern JS app, usually sanitized safely. A tentative pattern match
+  without an actual triggered `alert()`/DOM mutation is a code-review note,
+  not a finding — this is the single most common false-positive DOM XSS shape.
+
+*Enforced by code:* `record_finding` runs this through `ImpactValidator`'s
+`unconfirmed_dom_xss` check, which auto-kills DOM XSS findings that aren't
+`Confidence.CERTAIN` or don't show confirmed execution language.
 
 ## Severity
 High for stored/reflected XSS with a working execution PoC; Medium for

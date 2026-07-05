@@ -26,6 +26,11 @@ denial-of-service via nested queries.
 - Field suggestions / verbose errors as high severity by themselves.
 - A query erroring for another user's object — authorization is working.
 
+*Enforced by code:* `record_finding` runs this through `ImpactValidator`'s
+`not_info_noise` and `evidence_exists`/`reproducible` checks — introspection
+or verbose-error findings reported without a shown exploitation path will be
+flagged.
+
 ## Severity
 Follows the underlying class: Critical/High for authZ bypass or injection;
 Low/Info for introspection or verbose errors alone.

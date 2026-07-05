@@ -24,6 +24,10 @@ unintended state transitions. No signature; requires understanding intent.
   (you end blocked or corrected).
 - "Weird but harmless" behavior with no security or financial consequence.
 
+*Enforced by code:* `record_finding` runs this through `ImpactValidator`'s
+`evidence_exists`/`reproducible` and `not_info_noise` checks — a described
+abuse without a shown, reproduced final-state outcome will be flagged.
+
 ## Severity
 Case-by-case, driven by the demonstrated impact (financial loss, entitlement
 bypass, integrity violation). Always anchor to a shown outcome.

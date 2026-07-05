@@ -27,6 +27,20 @@ malicious origin read authenticated responses.
   content.
 - Preflight allowing methods/headers without a permissive ACAO+credentials pair.
 - A trusted, legitimately-allowlisted origin being reflected.
+- **CORS on a mobile-only API.** CORS attacks require a *browser* to visit an
+  attacker page and have it silently send credentials — a mobile app doesn't
+  browse arbitrary sites. If recon shows the target is mobile-only, this is
+  automatically killed regardless of the ACAO/ACAC combination.
+- **CORS on token/header auth (no cookies).** If the target authenticates via
+  `Authorization`/bearer/custom headers rather than cookies, an attacker page
+  can't get the browser to auto-attach those headers cross-origin — the
+  reflected ACAO is real but unexploitable. Confirm cookie-based auth before
+  calling this in-scope.
+
+*Enforced by code:* `record_finding` runs this through `ImpactValidator`'s
+`cors_relevance` check, which auto-kills CORS findings when the target is
+mobile-only or token-authenticated, and flags ones lacking demonstrated
+sensitive-data exposure.
 
 ## Severity
 High when reflected arbitrary origin + credentials exposes user data; otherwise

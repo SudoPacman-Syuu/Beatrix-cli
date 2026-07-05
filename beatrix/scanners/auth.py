@@ -1376,7 +1376,8 @@ The client '{client_id}' processed a password grant request
                     response = await self.get(url)
 
                 responses.append(response.status_code)
-                if response.status_code not in [429, 403]:
+                is_redirect = 300 <= response.status_code < 400
+                if response.status_code not in [429, 403] and not is_redirect:
                     success_count += 1
 
             except Exception:
@@ -1387,6 +1388,13 @@ The client '{client_id}' processed a password grant request
             # Skip if the endpoint doesn't actually exist (all 404s) —
             # can't report missing rate limiting on a non-existent page
             if responses and all(code == 404 for code in responses):
+                return findings
+
+            # Skip if every response was a redirect — the POST never reached
+            # real auth logic (e.g. an http->https or canonical-URL redirect
+            # before the login handler), so this test proves nothing about
+            # whether the actual endpoint rate-limits.
+            if responses and all(300 <= code < 400 for code in responses):
                 return findings
 
             findings.append(Finding(

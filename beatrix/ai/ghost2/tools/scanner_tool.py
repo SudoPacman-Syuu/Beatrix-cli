@@ -3,8 +3,12 @@
 
 Reuses ``BeatrixEngine``'s module registry (``_load_modules``) so the agent
 has the exact same arsenal the deterministic ``beatrix hunt`` pipeline uses,
-with zero duplication. Findings the scanner yields are buffered on the shared
-session and persisted at run finalize.
+with zero duplication. Findings the scanner yields pass through the same
+``impact_gate`` as ``record_finding`` before being buffered on the shared
+session — a real scan showed scanner-native findings (github_recon, nuclei,
+js_bundle, ...) go straight to the findings buffer with no validation
+otherwise, which is how findings like a documentation placeholder mis-flagged
+as a "MySQL Connection String" reached the final report unfiltered.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from typing import Any, List, Optional
 from agents import RunContextWrapper, function_tool
 
 from ..core.session import GhostSession
+from . import impact_gate
 
 # Lazily-built, process-wide scanner registry (name -> BaseScanner instance).
 _REGISTRY: Optional[dict] = None
@@ -87,17 +92,45 @@ async def run_scanner(ctx: RunContextWrapper[GhostSession], module: str, url: st
     except Exception as e:  # noqa: BLE001 - surface tool errors to the model
         return f"Scanner '{module}' errored on {url}: {type(e).__name__}: {e}"
 
+    killed = 0
+    flagged = 0
+    duplicate = 0
+    kept: List[Any] = []
     for f in findings:
         if not getattr(f, "scanner_module", ""):
             f.scanner_module = module
-        await session.add_finding(f)
+        gate = impact_gate.evaluate(f, session.scope)
+        if gate.action == "reject":
+            killed += 1
+            continue
+        if gate.action == "flag":
+            flagged += 1
+        added = await session.add_finding(gate.finding)
+        if not added:
+            duplicate += 1
+            continue
+        kept.append(gate.finding)
 
-    if not findings:
+    if not kept:
+        if killed or duplicate:
+            return (
+                f"{module} scan of {url}: {killed + duplicate} finding(s) found but "
+                f"none new ({killed} rejected as noise, {duplicate} already recorded)."
+            )
         return f"{module} scan of {url}: no findings."
-    lines = [f"{module} scan of {url}: {len(findings)} finding(s):"]
-    for f in findings[:15]:
+    header = f"{module} scan of {url}: {len(kept)} finding(s)"
+    extras = [f"{c} {n}" for n, c in (("rejected as noise", killed), ("duplicate", duplicate)) if c]
+    if extras:
+        header += " (" + ", ".join(extras) + ")"
+    lines = [header + ":"]
+    for f in kept[:15]:
         sev = getattr(getattr(f, "severity", None), "value", "info")
         lines.append(f"  [{sev}] {getattr(f, 'title', 'finding')} @ {getattr(f, 'url', url)}")
-    if len(findings) > 15:
-        lines.append(f"  … and {len(findings) - 15} more")
+    if len(kept) > 15:
+        lines.append(f"  … and {len(kept) - 15} more")
+    if flagged:
+        lines.append(
+            f"  ({flagged} flagged as needing more evidence — check impact "
+            "level before treating as confirmed)"
+        )
     return "\n".join(lines)

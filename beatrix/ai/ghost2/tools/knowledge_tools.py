@@ -1,11 +1,15 @@
 """
 Knowledge-base tools: ``load_skill`` and ``kb_search`` (issue #11).
 
-These give the agent progressive access to a curated corpus of vulnerability
-writeups (``knowledge/store/``). The prompts require exploitation and
-validation agents to ``load_skill`` the relevant class before claiming impact —
-the writeups define what *real* impact looks like and which signals are false
-positives, which is how the knowledge base reduces the FP rate.
+These give the agent progressive access to two kinds of document
+(``knowledge/store/``): a curated rubric writeup per vulnerability class, and
+genuine, publicly-disclosed HackerOne report excerpts backing each one. The
+prompts require exploitation and validation agents to ``load_skill`` the
+relevant class before claiming impact — the rubric defines what *real* impact
+looks like and which signals are false positives, and the attached real
+examples ground that in actual disclosed cases (real programs, real bounties)
+rather than synthesized ones. Output size never grows with the on-disk example
+corpus — see ``knowledge/index.py`` for how that's bounded.
 
 Both tools are read-only and cheap, so every role gets them.
 """
@@ -23,7 +27,9 @@ async def load_skill(topic: str) -> str:
 
     Consult this BEFORE claiming impact for a bug class: the writeup defines
     what genuine (non-false-positive) impact looks like, how to confirm it with
-    Beatrix's tools, and which signals are noise to reject.
+    Beatrix's tools, and which signals are noise to reject — followed by a
+    couple of real, publicly-disclosed HackerOne reports for that class, so
+    you're grounded in actual cases, not just the abstract rubric.
 
     ``topic`` accepts a scanner key (e.g. "idor", "ssrf", "injection", "bac"),
     a common name ("blind-ssrf", "jwt", "template-injection"), or a category
@@ -46,12 +52,16 @@ async def load_skill(topic: str) -> str:
 
 @function_tool
 async def kb_search(query: str, k: int = 3) -> str:
-    """Search the security knowledge base for writeups relevant to a query.
+    """Search the security knowledge base for writeups and real examples
+    relevant to a query.
 
-    Use this when you're not sure which vulnerability class applies, or want
-    guidance for a specific symptom (e.g. "response reflects filename in error"
-    or "jwt none algorithm"). Returns the top matches with a snippet each; call
-    load_skill(<category>) to read the full writeup.
+    Searches both rubric writeups and real, publicly-disclosed HackerOne
+    report excerpts together. Use this when you're not sure which
+    vulnerability class applies, or want guidance for a specific symptom
+    (e.g. "response reflects filename in error" or "jwt none algorithm").
+    Returns the top matches with a snippet each — rubric hits are marked
+    [rubric], real disclosed reports are marked [example]. Call
+    load_skill(<category>) to read a full rubric plus its strongest examples.
 
     Args:
         query: What you're looking for (a symptom, technique, or vuln class).
@@ -64,10 +74,10 @@ async def kb_search(query: str, k: int = 3) -> str:
     lines = [f"Top {len(results)} match(es) for '{query}':"]
     for writeup, score in results:
         lines.append(
-            f"  • [{writeup.category}] {writeup.title}  (score {score:.2f})\n"
+            f"  • [{writeup.kind}] [{writeup.category}] {writeup.title}  (score {score:.2f})\n"
             f"    {writeup.snippet()}"
         )
-    lines.append("Call load_skill(<category>) to read a full writeup.")
+    lines.append("Call load_skill(<category>) to read the full rubric + examples.")
     return "\n".join(lines)
 
 

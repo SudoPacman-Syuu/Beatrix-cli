@@ -25,6 +25,10 @@ letting an attacker execute template expressions and often reach RCE.
 - Client-side template frameworks (Angular/Vue) evaluating in the browser —
   that's client-side, potentially XSS, not server-side RCE.
 
+*Enforced by code:* `record_finding` runs this through `ImpactValidator`'s
+`evidence_exists`/`reproducible` checks — a claim of evaluation without a
+concrete reflected result or execution proof will be flagged.
+
 ## Severity
 Critical once you demonstrate command execution (OOB callback); High for
 confirmed expression evaluation without a shown code-exec path.

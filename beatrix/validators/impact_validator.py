@@ -138,6 +138,7 @@ class ImpactValidator:
         checks: List[ImpactCheck] = []
 
         # Run each check
+        checks.append(self._check_placeholder_credential(finding))
         checks.append(self._check_error_only(finding))
         checks.append(self._check_cors_relevance(finding, ctx))
         checks.append(self._check_public_data(finding, ctx))
@@ -200,6 +201,72 @@ class ImpactValidator:
     # ========================================================================
     # INDIVIDUAL CHECKS — Each one is a lesson paid for in blood
     # ========================================================================
+
+    def _check_placeholder_credential(self, finding: Finding) -> ImpactCheck:
+        """
+        LESSON: A regex matching a `user:pass@host` shape against a
+        documentation EXAMPLE line is not a finding.
+
+        airbnb/knowledge-repo 2026-07 — a scanner flagged
+        "SQLALCHEMY_DATABASE_URI = 'mysql://username:password@hostname/database'"
+        as a critical "MySQL Connection String" leak. That line is a
+        commented-out example in the file's own docs showing the config
+        syntax — "username"/"password"/"hostname"/"database" are literal
+        placeholder words, not a real credential. The active config two
+        lines above was SQLite in-memory. Passed every existing check
+        (evidence/reproducible/error_only all fire on different signals) —
+        nothing validated that the "secret" wasn't a template token.
+        """
+        title_lower = finding.title.lower()
+        is_credential_finding = any(term in title_lower for term in [
+            "connection string", "hardcoded secret", "hardcoded credential",
+            "api key", "credential", "secret", "password",
+        ])
+        if not is_credential_finding:
+            return ImpactCheck(
+                name="placeholder_credential",
+                passed=True,
+                reason="Not a credential/secret finding.",
+            )
+
+        combined = f"{finding.evidence or ''} {finding.payload or ''}".lower()
+
+        placeholder_tokens = [
+            "username", "hostname", "yourpassword", "your_password",
+            "changeme", "change_me", "your_api_key", "your_key_here",
+            "insert_key_here", "insert_your", "xxxxxxxx", "placeholder_key",
+            "<password>", "<secret>", "<api_key>", "<username>",
+            "${password}", "${secret}", "${api_key}",
+        ]
+        # "password" alone as the literal matched value (not part of a real
+        # secret string) is the exact shape of the airbnb/knowledge-repo bug —
+        # check it as a standalone token, not a substring, so a real secret
+        # that happens to contain "password" elsewhere isn't penalized.
+        tokens = re.findall(r"[a-z0-9_]+", combined)
+        token_set = set(tokens)
+        standalone_hits = {t for t in ("username", "password", "hostname", "database")
+                            if t in token_set}
+
+        matched = [t for t in placeholder_tokens if t in combined]
+        if matched or len(standalone_hits) >= 2:
+            signal = matched[0] if matched else ", ".join(sorted(standalone_hits))
+            return ImpactCheck(
+                name="placeholder_credential",
+                passed=False,
+                reason=f"Matched value looks like a documentation placeholder "
+                       f"({signal!r}), not a real credential. Verify the "
+                       "actual secret value before reporting — many scanners "
+                       "regex-match 'user:pass@host' shapes in example config "
+                       "lines and comments.",
+                severity_modifier=-2,
+                kill=True,
+            )
+
+        return ImpactCheck(
+            name="placeholder_credential",
+            passed=True,
+            reason="Credential value does not match known placeholder patterns.",
+        )
 
     def _check_error_only(self, finding: Finding) -> ImpactCheck:
         """

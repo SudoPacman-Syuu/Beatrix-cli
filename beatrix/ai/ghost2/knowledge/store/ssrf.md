@@ -30,6 +30,10 @@ external collaborator.
   not SSRF.
 - Callbacks to a shared CDN/analytics domain that the app legitimately calls.
 
+*Enforced by code:* `record_finding` runs this through `ImpactValidator`'s
+`evidence_exists`/`reproducible` checks — a claim with no OOB callback, no
+request/response, and no PoC will be flagged as needing real proof.
+
 ## Severity
 Critical when it reaches cloud metadata / internal services / credentials;
 High for confirmed blind SSRF via OOB with limited demonstrated reach.

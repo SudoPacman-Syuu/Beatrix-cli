@@ -616,12 +616,22 @@ class GitHubRecon(BaseScanner):
                         if entropy < MIN_SECRET_ENTROPY:
                             continue
 
-                    # Skip commented-out lines in source code
+                    # Commented-out lines are usually documentation/example
+                    # snippets, not live secrets — "mysql://username:password
+                    # @hostname/database" in a doc comment is a syntax example,
+                    # not a leak. Only keep it if the value still looks like a
+                    # genuine secret (high entropy) rather than dictionary
+                    # placeholder words used as connection-string components.
                     stripped = line.strip()
                     if stripped.startswith('//') or stripped.startswith('#') or stripped.startswith('*'):
-                        # Still flag it if it looks like a real secret
-                        if not any(p in value.lower() for p in ['example', 'test', 'sample', 'todo']):
-                            pass  # Keep the finding, commented secrets are still leaked
+                        looks_like_docs = (
+                            any(p in value.lower() for p in
+                                ['example', 'test', 'sample', 'todo',
+                                 'username', 'password', 'hostname', 'changeme'])
+                            or _shannon_entropy(value) < MIN_SECRET_ENTROPY
+                        )
+                        if looks_like_docs:
+                            continue
 
                     # Skip CI/test credentials (almost always FP)
                     if self._is_ci_test_credential(value, file_path):

@@ -26,6 +26,10 @@ commands the server executes.
 - Application-level errors from odd characters (validation rejection) rather
   than shell behavior.
 
+*Enforced by code:* `record_finding` runs this through `ImpactValidator`'s
+`evidence_exists`/`reproducible` checks — a claim with no OOB callback, no
+scaling timing delta, and no command output will be flagged.
+
 ## Severity
 Critical — command execution on the server. Always try to confirm with an OOB
 callback before reporting.
