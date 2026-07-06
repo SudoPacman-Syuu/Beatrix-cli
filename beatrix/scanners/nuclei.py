@@ -50,6 +50,28 @@ NUCLEI_SEVERITY_MAP = {
     "unknown": Severity.INFO,
 }
 
+# ── Per-host parallel scanning (issue #9) ────────────────────────────────
+# nuclei's -rate-limit is a single global budget per process, so packing
+# every subdomain into one invocation means the whole site shares one rate —
+# slow for large scopes, and if raised it 429s individual hosts. Instead we
+# partition targets by host and run several single-host nuclei processes at
+# once: each host gets its own safe per-host rate (no 429s), and a semaphore
+# caps how many run concurrently (so CPU/RAM stays bounded).
+
+# Hard ceiling on concurrent nuclei processes, regardless of CPU count —
+# each process loads the full template set into memory, so RAM, not CPU, is
+# the binding constraint. Overridable via config ``nuclei_max_parallel_hosts``.
+_DEFAULT_MAX_PARALLEL_HOSTS = 6
+
+# Total in-flight request concurrency to spread across the running processes
+# (each process gets ``budget // parallel``). Keeps the aggregate close to a
+# single process's default (-concurrency 25) rather than parallel × 25.
+_PARALLEL_CONCURRENCY_BUDGET = 50
+# Floor so a highly-parallel run doesn't starve each process to a crawl.
+_MIN_HOST_CONCURRENCY = 10
+# nuclei's own default when running a single host (unchanged behaviour).
+_DEFAULT_HOST_CONCURRENCY = 25
+
 
 class NucleiScanner(BaseScanner):
     """
@@ -879,7 +901,7 @@ class NucleiScanner(BaseScanner):
         if exclude_tags:
             cmd_extra.extend(["-exclude-tags", exclude_tags])
 
-        async for finding in self._run_nuclei(sampled, tags, cmd_extra=cmd_extra):
+        async for finding in self._run_nuclei_parallel(sampled, tags, cmd_extra=cmd_extra):
             yield finding
 
     async def scan_exploit(self, context: ScanContext) -> AsyncIterator[Finding]:
@@ -912,7 +934,7 @@ class NucleiScanner(BaseScanner):
             self.log(f"Excluding tags: {exclude_tags}")
 
         # Main tag-based scan
-        async for finding in self._run_nuclei(sampled, tags, cmd_extra=cmd_extra):
+        async for finding in self._run_nuclei_parallel(sampled, tags, cmd_extra=cmd_extra):
             yield finding
 
         # Workflow scan — technology-specific multi-step attack chains
@@ -920,7 +942,7 @@ class NucleiScanner(BaseScanner):
         if workflows:
             self.log(f"Running {len(workflows)} workflows: {', '.join(Path(w).stem for w in workflows)}")
             for wf in workflows:
-                async for finding in self._run_nuclei(
+                async for finding in self._run_nuclei_parallel(
                     sampled, tags="", cmd_extra=["-w", wf, "-severity", self._severity_filter]
                 ):
                     yield finding
@@ -947,7 +969,7 @@ class NucleiScanner(BaseScanner):
 
         cmd_extra = ["-t", str(network_template_dir), "-severity", self._severity_filter]
 
-        async for finding in self._run_nuclei(
+        async for finding in self._run_nuclei_parallel(
             self._network_targets, tags="", cmd_extra=cmd_extra
         ):
             yield finding
@@ -980,7 +1002,7 @@ class NucleiScanner(BaseScanner):
 
         cmd_extra = ["-headless", "-tags", "headless", "-severity", self._severity_filter]
 
-        async for finding in self._run_nuclei(list(set(urls)), tags="", cmd_extra=cmd_extra):
+        async for finding in self._run_nuclei_parallel(list(set(urls)), tags="", cmd_extra=cmd_extra):
             yield finding
 
     async def scan(self, context: ScanContext) -> AsyncIterator[Finding]:
@@ -1025,18 +1047,129 @@ class NucleiScanner(BaseScanner):
         if exclude_tags:
             cmd_extra.extend(["-exclude-tags", exclude_tags])
 
-        async for finding in self._run_nuclei(list(urls), tags, cmd_extra=cmd_extra):
+        async for finding in self._run_nuclei_parallel(list(urls), tags, cmd_extra=cmd_extra):
             yield finding
 
     # =====================================================================
     # CORE EXECUTION
     # =====================================================================
 
+    @staticmethod
+    def _host_of(target: str) -> str:
+        """Best-effort host key for a target (URL, ``host:port``, or bare host)."""
+        from urllib.parse import urlparse
+
+        if "://" in target:
+            host = urlparse(target).hostname
+        else:
+            # ``host:port`` network target or bare host — strip any path/port.
+            host = target.split("/", 1)[0].rsplit(":", 1)[0]
+        return (host or "").lower() or "_unknown"
+
+    def _group_targets_by_host(self, targets: List[str]) -> Dict[str, List[str]]:
+        """Partition targets by host, preserving order within each group."""
+        groups: Dict[str, List[str]] = {}
+        for t in targets:
+            groups.setdefault(self._host_of(t), []).append(t)
+        return groups
+
+    def _resolve_parallelism(self, num_hosts: int) -> int:
+        """How many single-host nuclei processes to run at once.
+
+        Bounded by the number of hosts, the configured/derived ceiling, and
+        available CPUs (each process is heavy). ``nuclei_max_parallel_hosts``
+        overrides the derived default.
+        """
+        configured = self.config.get("nuclei_max_parallel_hosts")
+        if configured:
+            try:
+                ceiling = max(1, int(configured))
+            except (TypeError, ValueError):
+                ceiling = _DEFAULT_MAX_PARALLEL_HOSTS
+        else:
+            cpu = os.cpu_count() or 4
+            ceiling = max(2, min(cpu // 2 or 1, _DEFAULT_MAX_PARALLEL_HOSTS))
+        return max(1, min(num_hosts, ceiling))
+
+    async def _run_nuclei_parallel(
+        self,
+        targets: List[str],
+        tags: str = "",
+        cmd_extra: Optional[List[str]] = None,
+    ) -> AsyncIterator[Finding]:
+        """Scan ``targets`` grouped by host, several hosts concurrently.
+
+        Each host runs as its own single-host ``_run_nuclei`` invocation so its
+        rate limit and 429/resume handling apply to that host alone (no host
+        absorbs another's share of a shared global rate). A semaphore caps how
+        many run at once and their per-process concurrency is scaled down so the
+        aggregate in-flight request count stays bounded — fast without a 429
+        storm or pinning the box.
+
+        Falls back to a single direct ``_run_nuclei`` when there's ≤1 host, so
+        single-target scans behave exactly as before.
+        """
+        groups = self._group_targets_by_host(targets)
+        if len(groups) <= 1:
+            async for finding in self._run_nuclei(targets, tags, cmd_extra=cmd_extra):
+                yield finding
+            return
+
+        parallel = self._resolve_parallelism(len(groups))
+        per_host_concurrency = max(
+            _MIN_HOST_CONCURRENCY, _PARALLEL_CONCURRENCY_BUDGET // parallel
+        )
+        self.log(
+            f"[nuclei] Parallel scan across {len(groups)} hosts "
+            f"({parallel} at a time, {per_host_concurrency} concurrency/host, "
+            f"{self._rate_limit} rps/host)"
+        )
+
+        sem = asyncio.Semaphore(parallel)
+        queue: asyncio.Queue = asyncio.Queue()
+        _DONE = object()
+
+        async def _worker(host: str, host_targets: List[str]) -> None:
+            async with sem:
+                try:
+                    async for finding in self._run_nuclei(
+                        host_targets, tags, cmd_extra=cmd_extra,
+                        concurrency=per_host_concurrency,
+                    ):
+                        await queue.put(finding)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001 - one host must not sink the scan
+                    self.log(f"[nuclei] host {host} scan failed: {type(e).__name__}: {e}")
+                finally:
+                    await queue.put(_DONE)
+
+        tasks = [
+            asyncio.create_task(_worker(host, host_targets))
+            for host, host_targets in groups.items()
+        ]
+
+        finished = 0
+        try:
+            while finished < len(tasks):
+                item = await queue.get()
+                if item is _DONE:
+                    finished += 1
+                else:
+                    yield item
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def _run_nuclei(
         self,
         targets: List[str],
         tags: str = "",
         cmd_extra: Optional[List[str]] = None,
+        *,
+        concurrency: Optional[int] = None,
     ) -> AsyncIterator[Finding]:
         """Execute nuclei and stream findings.
 
@@ -1135,7 +1268,7 @@ class NucleiScanner(BaseScanner):
                     "-retries", "2",
                     "-rate-limit", str(current_rate),
                     "-bulk-size", "50",
-                    "-concurrency", "25",
+                    "-concurrency", str(concurrency or _DEFAULT_HOST_CONCURRENCY),
                     "-stats",
                     "-stats-interval", "15",
                     "-resume", resume_file,
