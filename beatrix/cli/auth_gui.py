@@ -789,15 +789,20 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200, json.dumps(result).encode("utf-8"), "application/json")
 
 
-def serve_auth_gui(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True):
+def serve_auth_gui(host: str = "0.0.0.0", port: int = 8765, open_browser: bool = True):
     """Start the auth GUI server and block until Ctrl-C.
+
+    Binds ``0.0.0.0`` by default, not ``127.0.0.1`` — Codespaces' port-forwarding
+    tunnel can't reach a loopback-only listener, which surfaces as a bare 404
+    from the tunnel relay with no indication the bind address was the problem.
 
     Returns nothing; prints connection info. In Codespaces the forwarded URL is
     derived from the standard env vars so the user can click straight through.
     """
     httpd = ThreadingHTTPServer((host, port), _Handler)
     actual_port = httpd.server_address[1]
-    local_url = f"http://{host}:{actual_port}/"
+    display_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    local_url = f"http://{display_host}:{actual_port}/"
 
     # Codespaces exposes forwarded ports at <name>-<port>.<forwarding-domain>.
     codespace = os.environ.get("CODESPACE_NAME")

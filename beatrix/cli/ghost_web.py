@@ -78,6 +78,10 @@ _PAGE = r"""<!doctype html>
     padding:7px 18px; color:var(--muted); font-size:12px; display:flex; gap:18px; }
   .bar b { color:var(--fg); }
   .paused { color:var(--yellow); cursor:pointer; }
+  .btn { margin-left:auto; font:inherit; font-size:12px; color:var(--fg); background:var(--bg);
+    border:1px solid var(--border); border-radius:6px; padding:5px 11px; cursor:pointer; }
+  .btn:hover { border-color:var(--cyan); color:var(--cyan); }
+  .btn:active { transform:translateY(1px); }
 </style>
 </head>
 <body>
@@ -87,6 +91,7 @@ _PAGE = r"""<!doctype html>
   <span class="kv">model <b id="m-model">—</b></span>
   <span class="kv">auth <b id="m-auth">—</b></span>
   <span class="kv"><span id="dot" class="dot run"></span><b id="m-status">running</b></span>
+  <button id="save" class="btn" title="Save this run as a standalone HTML file">💾 Save HTML</button>
 </header>
 <div id="log"></div>
 <div class="bar">
@@ -107,6 +112,31 @@ document.getElementById("autoscroll").onclick = () => {
   autoscroll = !autoscroll;
   document.getElementById("autoscroll").textContent = "⤓ autoscroll: " + (autoscroll ? "on" : "off");
 };
+
+// Save the current dashboard (all streamed events + metadata, fully styled)
+// as a standalone HTML file for the record. The saved copy is static — the
+// live-polling script and interactive controls are stripped so it renders
+// stand-alone with no server.
+function saveHtml() {
+  const clone = document.documentElement.cloneNode(true);
+  clone.querySelectorAll("script").forEach(s => s.remove());
+  const rm = clone.querySelector("#save"); if (rm) rm.remove();
+  const as = clone.querySelector("#autoscroll"); if (as) as.remove();
+  const dot = clone.querySelector("#dot"); if (dot) dot.className = "dot done";
+  const st = clone.querySelector("#m-status");
+  if (st) st.textContent = (done ? "finished" : "in progress") + " · saved " + new Date().toLocaleString();
+  const html = "<!doctype html>\n" + clone.outerHTML;
+  const blob = new Blob([html], { type: "text/html" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const target = (document.getElementById("m-target").textContent || "target").replace(/[^a-z0-9.\-]+/gi, "_");
+  const ts = new Date().toISOString().replace(/[:]/g, "-").replace("T", "_").slice(0, 19);
+  a.href = url;
+  a.download = "ghost2-" + target + "-" + ts + ".html";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+document.getElementById("save").onclick = saveHtml;
 
 async function loadMeta() {
   const m = await (await fetch("/state")).json();
@@ -184,10 +214,17 @@ class _Broker:
 
 
 class GhostWebServer:
-    """Serves the live dashboard for one GHOST v2 run."""
+    """Serves the live dashboard for one GHOST v2 run.
+
+    Binds ``0.0.0.0`` by default, not ``127.0.0.1`` — Codespaces' port-forwarding
+    tunnel can't reach a loopback-only listener (it connects from outside the
+    process's own network namespace), which silently surfaces as a 404 from
+    the tunnel relay with no indication the bind address was the problem. The
+    printed/opened "local" URL still shows 127.0.0.1 for a clean local link.
+    """
 
     def __init__(self, meta: Optional[Dict[str, Any]] = None,
-                 host: str = "127.0.0.1", port: int = 8799):
+                 host: str = "0.0.0.0", port: int = 8799):
         self.broker = _Broker(meta or {})
         self.host = host
         self.port = port
@@ -242,7 +279,8 @@ class GhostWebServer:
             # rather than failing the run.
             self._httpd = ThreadingHTTPServer((self.host, 0), _H)
         self.port = self._httpd.server_address[1]
-        self.url = f"http://{self.host}:{self.port}/"
+        display_host = "127.0.0.1" if self.host in ("0.0.0.0", "::") else self.host
+        self.url = f"http://{display_host}:{self.port}/"
         threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
 
         codespace = os.environ.get("CODESPACE_NAME")
