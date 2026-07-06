@@ -13,24 +13,52 @@ An optional ``on_event`` sink receives the same activity as structured dicts
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 from agents import RunContextWrapper, RunHooks
 
 
+class BudgetExceededError(RuntimeError):
+    """Raised when a run crosses its configured LLM spend/call ceiling.
+
+    ``run_investigation`` catches this like ``MaxTurnsExceeded``: the run stops
+    cleanly and whatever findings already live on the session are still
+    reported and persisted, rather than the spend continuing unbounded.
+    """
+
+
 class GhostHooks(RunHooks):
-    """Streams agent activity to a Rich console and/or a structured event sink."""
+    """Streams agent activity to a Rich console and/or a structured event sink.
+
+    Also meters LLM usage across the whole run — the root agent *and* every
+    subagent share one ``GhostHooks`` instance (see ``graph_tools.spawn_agent``),
+    so token/cost accumulation and the budget circuit-breaker span the entire
+    agent graph, not a single loop.
+    """
 
     def __init__(
         self,
         console: Any = None,
         verbose: bool = False,
         on_event: Optional[Callable[[dict], None]] = None,
+        *,
+        model: Optional[str] = None,
+        max_budget_usd: Optional[float] = None,
+        max_llm_calls: Optional[int] = None,
     ):
         self.console = console
         self.verbose = verbose
         self.on_event = on_event
         self._last_system: Optional[str] = None  # emit a system prompt only when it changes
+
+        # Usage metering / spend guardrails.
+        self.model = model
+        self.max_budget_usd = max_budget_usd
+        self.max_llm_calls = max_llm_calls
+        self.llm_calls = 0
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.cost_usd = 0.0
 
     def _log(self, markup: str) -> None:
         if self.console is not None:
@@ -148,3 +176,79 @@ class GhostHooks(RunHooks):
         text = self._serialize_response(response)
         if text:
             self._emit("reasoning", "model reasoning", self._preview(text, 6000))
+        self._meter_usage(response)
+
+    # ── usage metering / budget ─────────────────────────────────────────
+    def _meter_usage(self, response: Any) -> None:
+        """Accumulate token/cost usage and enforce the run's spend ceiling.
+
+        Raises ``BudgetExceededError`` once the accumulated cost or call count
+        crosses a configured limit; the SDK propagates it out of ``Runner.run``,
+        which ``run_investigation`` handles like a turn-limit stop.
+        """
+        usage = getattr(response, "usage", None)
+        self.llm_calls += 1
+        in_tok = int(getattr(usage, "input_tokens", 0) or 0) if usage else 0
+        out_tok = int(getattr(usage, "output_tokens", 0) or 0) if usage else 0
+        self.input_tokens += in_tok
+        self.output_tokens += out_tok
+        self.cost_usd += _estimate_cost(self.model, in_tok, out_tok)
+
+        self._emit(
+            "usage",
+            f"llm calls: {self.llm_calls} · tokens: {self.input_tokens + self.output_tokens}",
+            f"est. cost: ${self.cost_usd:.4f}",
+        )
+
+        if self.max_llm_calls is not None and self.llm_calls >= self.max_llm_calls:
+            raise BudgetExceededError(
+                f"LLM call budget of {self.max_llm_calls} reached "
+                f"(spent ${self.cost_usd:.4f} over {self.llm_calls} calls)."
+            )
+        if self.max_budget_usd is not None and self.cost_usd >= self.max_budget_usd:
+            raise BudgetExceededError(
+                f"LLM budget of ${self.max_budget_usd:.2f} exceeded "
+                f"(spent ${self.cost_usd:.4f} over {self.llm_calls} calls)."
+            )
+
+    def usage_summary(self) -> Dict[str, Any]:
+        """Run-total usage, for the result dict and end-of-run reporting."""
+        return {
+            "llm_calls": self.llm_calls,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.input_tokens + self.output_tokens,
+            "cost_usd": round(self.cost_usd, 4),
+        }
+
+
+def _estimate_cost(model: Optional[str], input_tokens: int, output_tokens: int) -> float:
+    """Best-effort per-response USD cost via LiteLLM's pricing table.
+
+    Returns 0.0 when the model is unknown to LiteLLM (e.g. many OpenRouter
+    ``:free`` models) so a missing price never breaks a run — a call-count
+    budget (``max_llm_calls``) is the model-agnostic fallback ceiling.
+    """
+    if not model or (input_tokens <= 0 and output_tokens <= 0):
+        return 0.0
+    try:
+        import litellm
+    except Exception:
+        return 0.0
+
+    # Try the full "provider/model" id first, then the bare model name — some
+    # LiteLLM price-table keys carry a provider prefix and some don't.
+    candidates = [model]
+    if "/" in model:
+        candidates.append(model.split("/", 1)[1])
+    for name in candidates:
+        try:
+            prompt_cost, completion_cost = litellm.cost_per_token(
+                model=name, prompt_tokens=input_tokens, completion_tokens=output_tokens
+            )
+            cost = float(prompt_cost) + float(completion_cost)
+            if cost > 0:
+                return cost
+        except Exception:
+            continue
+    return 0.0

@@ -98,6 +98,16 @@ _ALIASES: Dict[str, str] = {
     "file_upload": "file-upload", "file-upload": "file-upload", "upload": "file-upload",
     "lfi": "path-traversal", "path-traversal": "path-traversal",
     "traversal": "path-traversal", "directory-traversal": "path-traversal",
+    # ── Tooling / recon (issue #11 category expansion) ──────────────────
+    "recon": "recon", "reconnaissance": "recon", "attack-surface": "recon",
+    "enumeration": "recon", "mapping": "recon", "fingerprint": "recon",
+    "subdomain": "recon", "osint": "recon",
+    "nuclei": "nuclei", "templates": "nuclei", "cve-scan": "nuclei",
+    "sqlmap": "sqlmap",
+    "fuzzing": "fuzzing", "fuzz": "fuzzing", "ffuf": "fuzzing",
+    "content-discovery": "fuzzing", "param-discovery": "fuzzing",
+    "parameter-discovery": "fuzzing", "arjun": "fuzzing", "wordlist": "fuzzing",
+    "dirbust": "fuzzing", "brute-force-paths": "fuzzing",
 }
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")

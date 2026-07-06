@@ -36,7 +36,10 @@ _ENV_API_KEY = "LLM_API_KEY"
 _ENV_API_BASE = "LLM_API_BASE"
 _ENV_REASONING = "BEATRIX_REASONING_EFFORT"
 _ENV_SANDBOX = "BEATRIX_SANDBOX"
+_ENV_SANDBOX_NETWORK = "BEATRIX_SANDBOX_NETWORK"
 _ENV_MAX_TURNS = "BEATRIX_MAX_TURNS"
+_ENV_MAX_BUDGET = "BEATRIX_MAX_BUDGET_USD"
+_ENV_MAX_LLM_CALLS = "BEATRIX_MAX_LLM_CALLS"
 
 # Fallback provider-native key env vars, tried in order when LLM_API_KEY is
 # unset. LiteLLM also reads most of these itself, but resolving here lets us
@@ -56,6 +59,15 @@ _KEYLESS_PROVIDERS = {"bedrock", "ollama", "vertex_ai", "sagemaker"}
 
 _VALID_REASONING = {"minimal", "low", "medium", "high"}
 _VALID_SANDBOX = {"docker", "host", "auto"}
+# Egress policy for the Docker sandbox container:
+#   open — container has normal outbound network (needed to reach the target)
+#   none — container is fully network-isolated (network_disabled); pure-Python
+#          in-process scanners still reach the target, but in-container shells
+#          and external binaries cannot phone anywhere.
+# Host-scoped allowlisting (only the target hosts) needs a forced egress proxy
+# and is tracked separately; "open"/"none" are the two policies enforceable
+# with a cap-dropped, no-new-privileges container today.
+_VALID_SANDBOX_NETWORK = {"open", "none"}
 
 
 @dataclass
@@ -71,8 +83,14 @@ class GhostV2Config:
     reasoning_effort: Optional[str] = None  # minimal|low|medium|high or None
     sandbox: str = "auto"                   # docker|host|auto
     sandbox_image: Optional[str] = None     # docker image for the sandbox runtime
+    sandbox_network: str = "open"           # open|none — Docker sandbox egress policy
     allow_host_exec: bool = False           # permit shell/python on the host runtime
     max_turns: int = 40
+    # Spend guardrails (Strix parity): stop the whole run when the accumulated
+    # LLM cost or call count crosses a limit, instead of only capping turns.
+    # None => unlimited (turn budget still applies).
+    max_budget_usd: Optional[float] = None
+    max_llm_calls: Optional[int] = None
     temperature: Optional[float] = None     # None => provider default
     max_tokens: Optional[int] = None
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -132,6 +150,11 @@ class GhostV2Config:
                 cls.sandbox,
             ),
             sandbox_image=ai.get("sandbox_image"),
+            sandbox_network=_pick_choice(
+                os.environ.get(_ENV_SANDBOX_NETWORK) or ai.get("sandbox_network"),
+                _VALID_SANDBOX_NETWORK,
+                cls.sandbox_network,
+            ),
             allow_host_exec=(
                 allow_host_exec
                 if allow_host_exec is not None
@@ -139,6 +162,12 @@ class GhostV2Config:
             ),
             max_turns=_pick_int(
                 max_turns, os.environ.get(_ENV_MAX_TURNS), ai.get("max_turns"), cls.max_turns
+            ),
+            max_budget_usd=_pick_float(
+                os.environ.get(_ENV_MAX_BUDGET), ai.get("max_budget_usd")
+            ),
+            max_llm_calls=_pick_opt_int(
+                os.environ.get(_ENV_MAX_LLM_CALLS), ai.get("max_llm_calls")
             ),
             temperature=ai.get("temperature"),
             max_tokens=ai.get("max_tokens"),
@@ -222,3 +251,33 @@ def _pick_int(*candidates: Any) -> int:
         except (TypeError, ValueError):
             continue
     return int(candidates[-1])
+
+
+def _pick_opt_int(*candidates: Any) -> Optional[int]:
+    """First candidate parseable as a positive int, else None (unlimited)."""
+    for c in candidates:
+        if c is None or c == "":
+            continue
+        try:
+            val = int(c)
+        except (TypeError, ValueError):
+            continue
+        if val > 0:
+            return val
+    return None
+
+
+def _pick_float(*candidates: Any) -> Optional[float]:
+    """First candidate parseable as a positive finite float, else None."""
+    import math
+
+    for c in candidates:
+        if c is None or c == "":
+            continue
+        try:
+            val = float(c)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(val) and val > 0:
+            return val
+    return None

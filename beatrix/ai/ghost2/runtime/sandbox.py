@@ -17,9 +17,13 @@ Design notes / current scope (M2 first cut):
 * Image is configurable (``ai.sandbox_image``); defaults to a lean
   ``python:3.11-slim`` so the driver works before the full ``ghost-sandbox``
   image (Beatrix + external binaries + Playwright) is built.
-* Egress allowlisting to ``session.scope`` and the host-side PoC/OOB callback
-  wiring are deliberately left for the hardening pass; a first working,
-  isolated exec path lands here.
+* Egress policy is configurable via ``ai.sandbox_network`` (``open`` | ``none``):
+  ``none`` starts the container fully network-isolated (``network_disabled``),
+  so in-container shells and external binaries cannot reach anything —
+  pure-Python in-process scanners still hit the target since they don't run in
+  the container. Host-scoped allowlisting (only the target hosts) needs a forced
+  egress proxy and is tracked separately; ``open`` (the default) keeps normal
+  outbound so tools can reach the target.
 """
 
 from __future__ import annotations
@@ -45,7 +49,7 @@ class DockerRuntime:
     allows_exec = True  # the whole point of the sandbox is to allow exec safely
 
     def __init__(self, cfg=None, *, image: Optional[str] = None, mem_limit: str = "1g",
-                 cpus: float = 2.0):
+                 cpus: float = 2.0, network: Optional[str] = None):
         import docker  # dispatch only builds this when the daemon is reachable
 
         self._docker = docker
@@ -53,6 +57,8 @@ class DockerRuntime:
         self.image = image or getattr(cfg, "sandbox_image", None) or DEFAULT_IMAGE
         self.mem_limit = mem_limit
         self.cpus = cpus
+        # Egress policy: "open" (default) or "none" (network_disabled container).
+        self.network = (network or getattr(cfg, "sandbox_network", None) or "open").lower()
         self._container = None
         self._lock = asyncio.Lock()
 
@@ -93,7 +99,9 @@ class DockerRuntime:
                 mem_limit=self.mem_limit,
                 nano_cpus=int(self.cpus * 1e9),
                 pids_limit=256,
-                network_disabled=False,  # scope-egress allowlist is a later pass
+                # Egress policy from ai.sandbox_network: "none" isolates the
+                # container's network entirely; "open" keeps normal outbound.
+                network_disabled=(self.network == "none"),
                 security_opt=["no-new-privileges"],
                 cap_drop=["ALL"],
                 volumes={self.host_workdir: {"bind": WORKDIR, "mode": "rw"}},

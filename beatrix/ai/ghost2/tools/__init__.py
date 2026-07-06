@@ -22,7 +22,7 @@ from typing import List
 from .exec_tools import python_exec, shell
 from .external_tool import run_external_tool
 from .findings_tool import record_finding
-from .graph_tools import spawn_agent
+from .graph_tools import spawn_agent, spawn_agents
 from .http_tools import compare_responses, encode_payload, http_request, inject
 from .knowledge_tools import kb_search, load_skill
 from .lifecycle_tools import agent_finish, finish_scan
@@ -44,7 +44,7 @@ _EXEC_TOOLS = [shell, python_exec]
 # Role → tool set (excluding meta/exec/lifecycle, which are added below).
 _ROLE_TOOLS = {
     "root": [
-        spawn_agent,              # delegate to subagents
+        spawn_agent, spawn_agents,  # delegate to subagents (sequential / parallel)
         http_request, run_scanner, run_external_tool,
         inject, encode_payload, compare_responses,
         oob_register, oob_poll,

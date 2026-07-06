@@ -61,7 +61,14 @@ async def run_investigation(
         base_cookies=base_cookies or {},
     )
     runtime = make_runtime(cfg, console=console)
-    hooks = GhostHooks(console=console, verbose=verbose, on_event=on_event)
+    hooks = GhostHooks(
+        console=console,
+        verbose=verbose,
+        on_event=on_event,
+        model=cfg.model,
+        max_budget_usd=cfg.max_budget_usd,
+        max_llm_calls=cfg.max_llm_calls,
+    )
     session = GhostSession(scope, runtime=runtime)
     # Run-scoped services the graph tools and OOB tools read off the session.
     session.cfg = cfg
@@ -84,8 +91,12 @@ async def run_investigation(
 
     from agents.exceptions import MaxTurnsExceeded
 
+    from .hooks import BudgetExceededError
+
     final_output: Optional[str] = None
     hit_turn_limit = False
+    hit_budget_limit = False
+    budget_message: Optional[str] = None
     try:
         result = await Runner.run(
             agent, initial, context=session, max_turns=cfg.max_turns, hooks=hooks
@@ -96,6 +107,11 @@ async def run_investigation(
         # Findings already live on the shared session, so still report/persist
         # them rather than losing the whole run.
         hit_turn_limit = True
+    except BudgetExceededError as e:
+        # Spend ceiling (cost or call count) hit. Same disposition as the turn
+        # limit: stop now, but keep and report whatever was already found.
+        hit_budget_limit = True
+        budget_message = str(e)
     finally:
         # Tear down the sandbox container (no-op for the host runtime) and the
         # OOB server.
@@ -129,6 +145,9 @@ async def run_investigation(
         "num_findings": len(findings),
         "final_output": final_output,
         "hit_turn_limit": hit_turn_limit,
+        "hit_budget_limit": hit_budget_limit,
+        "budget_message": budget_message,
+        "usage": hooks.usage_summary(),
         "modules_run": sorted(session.modules_run),
         "duration_secs": round(session.duration_secs, 1),
         "hunt_id": outcome["hunt_id"],

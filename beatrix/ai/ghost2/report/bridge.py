@@ -66,9 +66,27 @@ def _write_scan_dir(
         om.write_findings(findings)
         om.write_findings_summary(findings, duration)
         om.finalize(duration=duration, preset=PRESET, modules_run=modules)
+        _write_sarif(session, findings, om.scan_dir)
         return str(om.scan_dir)
     except Exception:
         return None
+
+
+def _write_sarif(session, findings: List[Any], scan_dir) -> None:
+    """Emit a ``findings.sarif`` sidecar for CI / code-scanning ingestion.
+
+    Best-effort and independently guarded: a SARIF failure must not lose the
+    JSON/summary artifacts the rest of ``_write_scan_dir`` already wrote.
+    """
+    try:
+        from pathlib import Path
+
+        from .sarif import write_sarif
+
+        target = getattr(getattr(session, "scope", None), "target", "") or ""
+        write_sarif(Path(scan_dir) / "findings.sarif", findings, target=target)
+    except Exception:
+        pass
 
 
 def _persist(
