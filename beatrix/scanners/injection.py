@@ -769,8 +769,13 @@ class InjectionScanner(BaseScanner):
     def _select_categories(self, ip: InsertionPoint) -> List[str]:
         """Select payload categories based on insertion point type"""
 
-        # URL and body params get everything
-        if ip.type in [InsertionPointType.URL_PARAM, InsertionPointType.BODY_PARAM, InsertionPointType.JSON_VALUE]:
+        # URL and body params (incl. multipart form fields) get everything
+        if ip.type in [
+            InsertionPointType.URL_PARAM,
+            InsertionPointType.BODY_PARAM,
+            InsertionPointType.JSON_VALUE,
+            InsertionPointType.MULTIPART,
+        ]:
             return ["sqli", "xss", "ssti", "cmdi", "path"]
 
         # Headers get limited testing

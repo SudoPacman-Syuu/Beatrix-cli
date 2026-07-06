@@ -7,11 +7,11 @@ This is the foundation for all injection testing (SQLi, XSS, SSTI, etc).
 
 Based on Sweet Scanner's insertion point concept:
 - URL parameters
-- Body parameters (form, JSON, XML)
+- Body parameters (form-urlencoded, JSON, XML, multipart/form-data)
 - Headers
 - Cookies
 - Path segments
-- File names
+- File names (multipart upload filenames)
 
 Reference: Sweet Scanner's IScannerInsertionPoint interface
 """
@@ -36,6 +36,99 @@ class BodyFormat(Enum):
     RAW = auto()
 
 
+# Sub-targets within a multipart part, carried in an InsertionPoint's
+# ``position[1]`` so the injector knows *what* to overwrite in the part
+# ``position[0]`` names.
+MULTIPART_VALUE = 0     # the field's value / file content
+MULTIPART_FILENAME = 1  # a file part's filename="..." attribute
+
+
+@dataclass
+class MultipartPart:
+    """One part of a ``multipart/form-data`` body.
+
+    ``content`` is kept as raw bytes so binary file parts round-trip
+    losslessly; ``text_value`` is a best-effort decode for text fields and
+    for reporting.
+    """
+    name: str
+    content: bytes
+    filename: Optional[str] = None
+    content_type: Optional[str] = None
+    is_file: bool = False
+
+    @property
+    def text_value(self) -> str:
+        return self.content.decode("utf-8", errors="replace")
+
+
+def _extract_boundary(content_type: str) -> Optional[str]:
+    """Pull the boundary token out of a multipart Content-Type header."""
+    m = re.search(r'boundary="?([^";]+)"?', content_type, re.IGNORECASE)
+    return m.group(1).strip() if m else None
+
+
+def parse_multipart(body: bytes, content_type: str) -> List[MultipartPart]:
+    """Parse a ``multipart/form-data`` body into ordered parts.
+
+    Splits on the exact ``--boundary`` delimiter (which, being unique, means
+    field values containing CRLFs are preserved intact) and pulls the field
+    name, optional filename, and per-part Content-Type out of each section's
+    headers. Returns ``[]`` if the boundary can't be found.
+    """
+    boundary = _extract_boundary(content_type)
+    if not boundary or not body:
+        return []
+
+    delim = b"--" + boundary.encode()
+    parts: List[MultipartPart] = []
+    for chunk in body.split(delim):
+        section = chunk.strip(b"\r\n")
+        if not section or section == b"--":  # preamble / closing marker
+            continue
+        sep = section.find(b"\r\n\r\n")
+        if sep == -1:
+            continue
+        head = section[:sep].decode("utf-8", errors="replace")
+        content = section[sep + 4:]
+
+        name_m = re.search(r'name="([^"]*)"', head)
+        if not name_m:
+            continue  # not a form-data part we can target
+        file_m = re.search(r'filename="([^"]*)"', head)
+        ct_m = re.search(r'Content-Type:\s*([^\r\n]+)', head, re.IGNORECASE)
+
+        parts.append(MultipartPart(
+            name=name_m.group(1),
+            content=content,
+            filename=file_m.group(1) if file_m else None,
+            content_type=ct_m.group(1).strip() if ct_m else None,
+            is_file=file_m is not None,
+        ))
+    return parts
+
+
+def serialize_multipart(parts: List[MultipartPart], boundary: str) -> bytes:
+    """Rebuild a ``multipart/form-data`` body from parts using ``boundary``.
+
+    The caller must reuse the original request's boundary so the rebuilt body
+    stays consistent with the (unchanged) Content-Type header.
+    """
+    delim = ("--" + boundary).encode()
+    out = bytearray()
+    for p in parts:
+        out += delim + b"\r\n"
+        disp = f'Content-Disposition: form-data; name="{p.name}"'
+        if p.filename is not None:
+            disp += f'; filename="{p.filename}"'
+        out += disp.encode() + b"\r\n"
+        if p.content_type:
+            out += f"Content-Type: {p.content_type}".encode() + b"\r\n"
+        out += b"\r\n" + p.content + b"\r\n"
+    out += delim + b"--\r\n"
+    return bytes(out)
+
+
 @dataclass
 class ParsedRequest:
     """Fully parsed HTTP request with all components"""
@@ -53,6 +146,7 @@ class ParsedRequest:
     body_params: Dict[str, Any] = field(default_factory=dict)
     path_segments: List[str] = field(default_factory=list)
     json_paths: List[Tuple[str, Any]] = field(default_factory=list)
+    multipart_parts: List[MultipartPart] = field(default_factory=list)
 
 
 class InsertionPointDetector:
@@ -153,6 +247,16 @@ class InsertionPointDetector:
         content_type = headers.get("content-type", headers.get("Content-Type", ""))
         body_format, body_params = self._parse_body(body, content_type)
 
+        # Multipart bodies carry an ordered part structure (text fields + file
+        # parts) that a flat dict can't represent; parse it out so both
+        # detection and injection can work with the real fields.
+        multipart_parts: List[MultipartPart] = []
+        if body_format == BodyFormat.MULTIPART:
+            multipart_parts = parse_multipart(body, content_type)
+            body_params = {
+                p.name: p.text_value for p in multipart_parts if not p.is_file
+            }
+
         # Parse path segments
         path_segments = [s for s in parsed_url.path.split("/") if s]
 
@@ -168,6 +272,7 @@ class InsertionPointDetector:
             url_params=url_params,
             body_params=body_params,
             path_segments=path_segments,
+            multipart_parts=multipart_parts,
         )
 
     def _parse_body(
@@ -201,9 +306,9 @@ class InsertionPointDetector:
         if "application/xml" in ct_lower or "text/xml" in ct_lower:
             return BodyFormat.XML, {"_raw": body.decode("utf-8", errors="ignore")}
 
-        # Multipart
+        # Multipart — the ordered part structure (text fields + file parts)
+        # is parsed in parse_request, which populates body_params from it.
         if "multipart/form-data" in ct_lower:
-            # TODO: Proper multipart parsing
             return BodyFormat.MULTIPART, {}
 
         return BodyFormat.RAW, {}
@@ -251,6 +356,43 @@ class InsertionPointDetector:
                         original_request=None,
                         position=(0, 0),
                     ))
+
+        elif request.body_format == BodyFormat.MULTIPART:
+            points.extend(self._detect_multipart(request))
+
+        return points
+
+    def _detect_multipart(self, request: ParsedRequest) -> List[InsertionPoint]:
+        """Detect insertion points in a multipart/form-data body.
+
+        Every text field's value is injectable; for file parts the filename
+        is the high-value target (path traversal / RCE on upload endpoints).
+        ``position`` carries ``(part_index, sub_target)`` so the injector can
+        overwrite the exact part without re-matching by name.
+        """
+        points: List[InsertionPoint] = []
+
+        for idx, part in enumerate(request.multipart_parts):
+            if part.is_file:
+                # Inject into the filename (its own recognised attack surface).
+                # File *content* is left alone: injecting scan payloads into
+                # binary uploads rarely produces an immediately observable
+                # signal and mostly just adds request volume.
+                points.append(InsertionPoint(
+                    name=part.name,
+                    value=part.filename or "",
+                    type=InsertionPointType.MULTIPART,
+                    original_request=None,
+                    position=(idx, MULTIPART_FILENAME),
+                ))
+            else:
+                points.append(InsertionPoint(
+                    name=part.name,
+                    value=part.text_value,
+                    type=InsertionPointType.MULTIPART,
+                    original_request=None,
+                    position=(idx, MULTIPART_VALUE),
+                ))
 
         return points
 
@@ -399,6 +541,9 @@ class InsertionPointDetector:
         elif insertion_point.type == InsertionPointType.JSON_VALUE:
             body = self._inject_json_value(request, insertion_point.name, payload)
 
+        elif insertion_point.type == InsertionPointType.MULTIPART:
+            body = self._inject_multipart(request, insertion_point, payload)
+
         return url, headers, body
 
     def _inject_url_param(self, request: ParsedRequest, name: str, payload: str) -> str:
@@ -474,3 +619,48 @@ class InsertionPointDetector:
             obj[final_key] = payload
 
         return json.dumps(data).encode()
+
+    def _inject_multipart(
+        self,
+        request: ParsedRequest,
+        insertion_point: InsertionPoint,
+        payload: str,
+    ) -> bytes:
+        """Rebuild the multipart body with ``payload`` in the target part.
+
+        Uses ``insertion_point.position`` — ``(part_index, sub_target)`` set at
+        detection time — to overwrite exactly one part's value or filename,
+        rebuilding with the request's original boundary so the Content-Type
+        header stays valid. The original parts are never mutated (the scanner
+        reuses one ParsedRequest across many payloads).
+        """
+        content_type = request.headers.get(
+            "content-type", request.headers.get("Content-Type", "")
+        )
+        boundary = _extract_boundary(content_type)
+        parts = request.multipart_parts
+        if not boundary or not parts:
+            return request.body
+
+        index, sub_target = insertion_point.position
+        if not (0 <= index < len(parts)):
+            return request.body
+
+        target = parts[index]
+        # Copy just the targeted part so concurrent/subsequent payloads on the
+        # same request don't see this mutation.
+        patched = MultipartPart(
+            name=target.name,
+            content=target.content,
+            filename=target.filename,
+            content_type=target.content_type,
+            is_file=target.is_file,
+        )
+        if sub_target == MULTIPART_FILENAME:
+            patched.filename = payload
+        else:
+            patched.content = payload.encode("utf-8", errors="surrogateescape")
+
+        rebuilt = list(parts)
+        rebuilt[index] = patched
+        return serialize_multipart(rebuilt, boundary)
