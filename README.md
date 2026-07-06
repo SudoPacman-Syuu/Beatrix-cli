@@ -1,4 +1,4 @@
-# BEATRIX CLI — The Black Mamba
+# BEATRIX SUITE — The Black Mamba
 
 > *"Revenge is a dish best served with a working PoC."*
 
