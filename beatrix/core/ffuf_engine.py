@@ -105,6 +105,7 @@ class FuzzResult:
     content_type: str = ""
     redirect_location: str = ""
     matched_by: str = ""  # What matched (regex, status, etc.)
+    resultfile: str = ""  # ffuf -od filename holding the raw response (if captured)
 
 
 @dataclass
@@ -231,6 +232,25 @@ VULN_MATCHERS = {
 }
 
 
+# ffuf's -od file interleaves the raw request and response, joined by a
+# "---- Response ----"-style banner line (exact arrows vary by ffuf version).
+_OD_RESPONSE_MARKER = re.compile(r"^-+.*Response.*-+\r?$", re.MULTILINE)
+_HEADER_BODY_SEP = re.compile(r"\r?\n\r?\n")
+
+
+def _extract_response_body(raw: str) -> str:
+    """Pull just the response body out of one ffuf ``-od`` capture file.
+
+    Falls back to returning the input unchanged if the expected markers
+    aren't found, so a format quirk degrades to "no match" rather than
+    raising.
+    """
+    marker = _OD_RESPONSE_MARKER.search(raw)
+    section = raw[marker.end():].lstrip("\r\n") if marker else raw
+    body_sep = _HEADER_BODY_SEP.search(section)
+    return section[body_sep.end():] if body_sep else section
+
+
 # =============================================================================
 # FFUF ENGINE
 # =============================================================================
@@ -323,8 +343,15 @@ class FFufEngine:
         headers: Dict[str, str] = None,
         data: str = None,
         cookies: str = None,
+        od_dir: Optional[Path] = None,
     ) -> List[str]:
-        """Build ffuf command with appropriate flags"""
+        """Build ffuf command with appropriate flags.
+
+        ``od_dir``, when given, adds ``-od`` so ffuf writes each matched
+        result's raw response to that directory — the response bodies
+        ``_filter_results_by_regex`` needs to confirm a hit for pattern-based
+        vuln types (XSS/SQLi/LFI/RCE/SSTI/SSRF).
+        """
 
         cmd = [
             self.ffuf_path,
@@ -337,6 +364,9 @@ class FFufEngine:
             "-ac",  # Auto-calibrate filtering
             "-se",  # Stop on spurious errors
         ]
+
+        if od_dir is not None:
+            cmd.extend(["-od", str(od_dir)])
 
         # Method
         if method.upper() != "GET":
@@ -445,6 +475,7 @@ class FFufEngine:
                     duration_ms=result.get("duration", 0),
                     content_type=result.get("content-type", ""),
                     redirect_location=result.get("redirectlocation", ""),
+                    resultfile=result.get("resultfile", ""),
                 )
                 results.append(fuzz_result)
 
@@ -457,8 +488,30 @@ class FFufEngine:
 
         return results
 
-    # TODO: Wire _filter_results_by_regex into the pipeline once ffuf's
-    # -od flag is used to capture per-response bodies (needs response storage).
+    def _load_response_bodies(
+        self,
+        results: List[FuzzResult],
+        od_dir: Path,
+    ) -> Dict[str, str]:
+        """Read the raw responses ffuf wrote via ``-od`` into a url->body map.
+
+        Each result's ``resultfile`` names a file under ``od_dir`` containing
+        the interleaved raw request and response ffuf sent/received for that
+        hit; this pulls out just the response body for ``_filter_results_by_regex``.
+        """
+        responses: Dict[str, str] = {}
+        for result in results:
+            if not result.resultfile:
+                continue
+            try:
+                raw = (od_dir / result.resultfile).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                continue
+            responses[result.url] = _extract_response_body(raw)
+        return responses
+
     def _filter_results_by_regex(
         self,
         results: List[FuzzResult],
@@ -511,9 +564,15 @@ class FFufEngine:
         matcher = VULN_MATCHERS.get(vuln_type, {})
 
         for result in results:
-            # Determine confidence based on match type
-            if result.matched_by:
-                confidence = "high" if "regex" in result.matched_by else "medium"
+            # Determine confidence based on match type: a response actually
+            # matching a vuln-specific pattern (SQL error text, /etc/passwd
+            # contents, ...) is stronger evidence than a bare payload
+            # reflection, which weaker signals (encoding, sanitization) can
+            # still slip past.
+            if result.matched_by == "payload_reflection":
+                confidence = "medium"
+            elif result.matched_by:
+                confidence = "high"
             else:
                 confidence = "low"
 
@@ -563,7 +622,12 @@ class FFufEngine:
             headers: Additional headers
             data: POST data (use FUZZ marker for payload position)
             cookies: Cookies to send
-            verify_reflection: For XSS, verify payload appears in response
+            verify_reflection: Confirm each hit against the actual response
+                body (vuln-specific regex patterns, plus raw payload
+                reflection for XSS) instead of trusting ffuf's status/size
+                filtering alone. Costs one extra response-body read per hit
+                (via ffuf's -od); disable only if you want ffuf's raw,
+                unfiltered hits.
 
         Returns:
             List of findings
@@ -584,6 +648,16 @@ class FFufEngine:
         # Output file for results
         output_file = self.temp_dir / f"results_{vuln_type.value}_{hash(url) % 10000}.json"
 
+        # Only ask ffuf to capture raw responses (-od) when there's a
+        # matcher this filtering step can actually use — match_status-only
+        # types (open redirect) are already fully filtered by ffuf's -mc/-fc.
+        matcher = VULN_MATCHERS.get(vuln_type, {})
+        needs_bodies = verify_reflection and bool(matcher.get("match_regex"))
+        od_dir = (
+            self.temp_dir / f"od_{vuln_type.value}_{hash(url) % 10000}"
+            if needs_bodies else None
+        )
+
         # Build and run ffuf command
         cmd = self._build_ffuf_command(
             url=url,
@@ -594,6 +668,7 @@ class FFufEngine:
             headers=headers,
             data=data,
             cookies=cookies,
+            od_dir=od_dir,
         )
 
         success, error = self._run_ffuf(cmd)
@@ -603,6 +678,18 @@ class FFufEngine:
 
         # Parse results
         results = self._parse_ffuf_results(output_file, vuln_type, parameter)
+
+        # Confirm hits against the real response body instead of trusting
+        # ffuf's status/size filtering alone (issue #3: this step existed
+        # but was never wired in, so every ffuf hit became a finding).
+        if needs_bodies and results:
+            responses = self._load_response_bodies(results, od_dir)
+            results = self._filter_results_by_regex(results, vuln_type, responses)
+            if self.verbose:
+                print(f"    [ffuf] {len(results)} confirmed by response-body match")
+
+        if od_dir is not None:
+            shutil.rmtree(od_dir, ignore_errors=True)
 
         # Convert to findings
         findings = self._results_to_findings(results, vuln_type, parameter, method)
