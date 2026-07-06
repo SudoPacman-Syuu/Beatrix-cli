@@ -68,7 +68,11 @@ async def _run_subagent(session: GhostSession, role: str, task: str) -> str:
     subagent = build_subagent(role, session.scope, cfg, runtime=session.runtime)
     session._emit("spawn_agent", role, task)
 
-    budget = min(getattr(cfg, "max_turns", _SUBAGENT_MAX_TURNS), _SUBAGENT_MAX_TURNS)
+    # Each subagent stays bounded by _SUBAGENT_MAX_TURNS so one focused
+    # delegation can't run away — even when the root orchestrator is uncapped
+    # (cfg.max_turns is None). A smaller root cap still lowers it further.
+    _root = getattr(cfg, "max_turns", None)
+    budget = _SUBAGENT_MAX_TURNS if not _root else min(_root, _SUBAGENT_MAX_TURNS)
     try:
         result = await Runner.run(
             subagent, task, context=session,

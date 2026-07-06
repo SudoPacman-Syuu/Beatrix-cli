@@ -85,7 +85,10 @@ class GhostV2Config:
     sandbox_image: Optional[str] = None     # docker image for the sandbox runtime
     sandbox_network: str = "open"           # open|none — Docker sandbox egress policy
     allow_host_exec: bool = False           # permit shell/python on the host runtime
-    max_turns: int = 40
+    # Root orchestrator turn ceiling. None => uncapped: the agent runs until it
+    # calls finish_scan (or a spend guardrail below fires). Set a positive int
+    # via --max-turns / BEATRIX_MAX_TURNS / ai.max_turns to re-impose a cap.
+    max_turns: Optional[int] = None
     # Spend guardrails (Strix parity): stop the whole run when the accumulated
     # LLM cost or call count crosses a limit, instead of only capping turns.
     # None => unlimited (turn budget still applies).
@@ -160,8 +163,9 @@ class GhostV2Config:
                 if allow_host_exec is not None
                 else bool(ai.get("allow_host_exec", False))
             ),
-            max_turns=_pick_int(
-                max_turns, os.environ.get(_ENV_MAX_TURNS), ai.get("max_turns"), cls.max_turns
+            # Uncapped unless a positive value is supplied; <=0 also means uncapped.
+            max_turns=_pick_opt_int(
+                max_turns, os.environ.get(_ENV_MAX_TURNS), ai.get("max_turns")
             ),
             max_budget_usd=_pick_float(
                 os.environ.get(_ENV_MAX_BUDGET), ai.get("max_budget_usd")

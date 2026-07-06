@@ -90,6 +90,24 @@ def test_config_provider_property():
     assert GhostV2Config(model="bare-model-no-prefix").provider == ""
 
 
+def test_max_turns_uncapped_by_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("BEATRIX_MAX_TURNS", raising=False)
+    missing = tmp_path / "none.yaml"
+
+    # Default: no turn cap — the agent runs until finish_scan (None => SDK
+    # treats it as unlimited).
+    assert GhostV2Config.load(config_path=missing).max_turns is None
+
+    # A positive value re-imposes a cap; <=0 means uncapped.
+    assert GhostV2Config.load(max_turns=50, config_path=missing).max_turns == 50
+    assert GhostV2Config.load(max_turns=0, config_path=missing).max_turns is None
+
+    # Env and yaml resolve too, CLI arg wins.
+    monkeypatch.setenv("BEATRIX_MAX_TURNS", "123")
+    assert GhostV2Config.load(config_path=missing).max_turns == 123
+    assert GhostV2Config.load(max_turns=10, config_path=missing).max_turns == 10
+
+
 # ── Tools: native schema generation ──────────────────────────────────────
 def test_collect_tools_has_expected_set():
     tools = collect_tools("root")

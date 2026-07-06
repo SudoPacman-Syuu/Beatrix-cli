@@ -4899,7 +4899,8 @@ def ghost(ctx, target, objective, method, header, data, max_turns, model, api_ke
               help="Tool execution runtime: docker sandbox, host, or auto (Docker if available)")
 @click.option("--allow-host-exec", is_flag=True, default=False,
               help="Permit shell/python_exec on the HOST runtime (unsafe; sandbox is preferred)")
-@click.option("--max-turns", "-t", type=int, default=None, help="Maximum agent turns")
+@click.option("--max-turns", "-t", type=int, default=None,
+              help="Max root-agent turns (default: unlimited — runs until finish_scan)")
 @click.option("--no-persist", is_flag=True, help="Do not save findings to the findings database")
 @click.option("--no-auth", is_flag=True, help="Do not auto-load saved auth (auth.yaml / sessions)")
 @click.option("--no-web", is_flag=True, help="Disable the live browser dashboard (on by default)")
@@ -4989,7 +4990,7 @@ def ghost2(ctx, target, objective, header, model, api_base, reasoning, sandbox, 
         f"[bold]Auth:[/bold]      "
         + (f"{auth_status} ({len(base_cookies)} cookies, {len(base_headers)} headers)"
            if auth_status != "none" else "none") + "\n"
-        f"[bold]Max Turns:[/bold] {cfg.max_turns}",
+        f"[bold]Max Turns:[/bold] {cfg.max_turns if cfg.max_turns else 'unlimited'}",
         title="[bold bright_red]👻 GHOST v2[/bold bright_red]",
         border_style="red",
     ))
@@ -5048,7 +5049,7 @@ def ghost2(ctx, target, objective, header, model, api_base, reasoning, sandbox, 
     verdict_color = "red" if result["verdict"] == "VULNERABLE" else "green"
     console.print(f"\n[bold {verdict_color}]Verdict: {result['verdict']}[/bold {verdict_color}]")
     console.print(
-        f"[dim]Turns budget: {cfg.max_turns} | modules used: "
+        f"[dim]Turns budget: {cfg.max_turns if cfg.max_turns else 'unlimited'} | modules used: "
         f"{', '.join(result['modules_run']) or 'none'} | {result['duration_secs']}s[/dim]"
     )
     if result["findings"]:
