@@ -1354,6 +1354,12 @@ The client '{client_id}' processed a password grant request
 
     # =========== RATE LIMITING ===========
 
+    # Status codes that mean the request never reached working auth logic, so
+    # they can neither be a "successful" attempt nor evidence of missing rate
+    # limiting: the handler didn't run. 404 not found, 405 wrong method, 415
+    # unsupported media, 501 not implemented.
+    _NON_AUTH_STATUS = frozenset({404, 405, 415, 501})
+
     async def test_rate_limiting(self, url: str, method: str = "POST", data: Optional[Dict] = None) -> List[Finding]:
         """Test if rate limiting is properly implemented"""
         findings = []
@@ -1377,7 +1383,12 @@ The client '{client_id}' processed a password grant request
 
                 responses.append(response.status_code)
                 is_redirect = 300 <= response.status_code < 400
-                if response.status_code not in [429, 403] and not is_redirect:
+                # A "success" here means a real auth attempt got processed and
+                # was NOT throttled. Throttling (429/403), redirects, and codes
+                # that mean the handler never ran (404/405/415/501) don't count.
+                if (response.status_code not in (429, 403)
+                        and not is_redirect
+                        and response.status_code not in self._NON_AUTH_STATUS):
                     success_count += 1
 
             except Exception:
@@ -1385,16 +1396,15 @@ The client '{client_id}' processed a password grant request
 
         # If most requests succeeded, no rate limiting
         if success_count >= num_requests - 2:
-            # Skip if the endpoint doesn't actually exist (all 404s) —
-            # can't report missing rate limiting on a non-existent page
-            if responses and all(code == 404 for code in responses):
-                return findings
-
-            # Skip if every response was a redirect — the POST never reached
-            # real auth logic (e.g. an http->https or canonical-URL redirect
-            # before the login handler), so this test proves nothing about
-            # whether the actual endpoint rate-limits.
-            if responses and all(300 <= code < 400 for code in responses):
+            # Skip if no request ever reached working auth logic — every
+            # response was a redirect or a "handler didn't run" code (404 not
+            # found, 405 method not allowed on a GET-only/other endpoint, ...).
+            # The test proves nothing about whether real auth rate-limits.
+            # (This also subsumes the all-404 and all-redirect cases.)
+            if responses and all(
+                (300 <= code < 400) or code in self._NON_AUTH_STATUS
+                for code in responses
+            ):
                 return findings
 
             findings.append(Finding(

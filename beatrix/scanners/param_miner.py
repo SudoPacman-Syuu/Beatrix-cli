@@ -201,7 +201,15 @@ class ParamMiner(BaseScanner):
     # ─────────────────────────────────────────────────────────────────────
 
     async def _get_baseline(self, url: str) -> Optional[Dict[str, Any]]:
-        """Get a stable baseline fingerprint for the URL."""
+        """Get a stable baseline fingerprint for the URL.
+
+        Also auto-calibrates: any field that already differs between two
+        *identical* requests is volatile (per-response nonces, timestamps in
+        the body, rotating cache/session headers, ...) and is recorded so it
+        won't later be mistaken for a parameter-induced change. This is what
+        keeps a CDN's ever-incrementing ``Age`` header (and similar noise)
+        from flagging every probed parameter as a cache-poisoning hit.
+        """
         try:
             resp1 = await self.get(url)
             await asyncio.sleep(0.1)
@@ -223,6 +231,9 @@ class ParamMiner(BaseScanner):
             logger.debug(f"Baseline unstable (length varies by {length_diff}): {url}")
             return None
 
+        # Record volatile diff-keys (those that already vary between two
+        # identical requests) so _responses_differ can ignore them.
+        fp1["_volatile"] = frozenset(self._responses_differ(fp1, fp2).keys())
         return fp1
 
     def _fingerprint(self, resp) -> Dict[str, Any]:
@@ -255,7 +266,12 @@ class ParamMiner(BaseScanner):
     def _responses_differ(
         self, baseline: Dict[str, Any], test: Dict[str, Any]
     ) -> Dict[str, Tuple]:
-        """Compare baseline and test fingerprints, return meaningful diffs."""
+        """Compare baseline and test fingerprints, return meaningful diffs.
+
+        Volatile fields recorded on the baseline during calibration (see
+        ``_get_baseline``) are ignored so per-response noise isn't reported as
+        a parameter-induced change.
+        """
         diffs = {}
 
         # Status code change is always significant
@@ -281,14 +297,26 @@ class ParamMiner(BaseScanner):
         if new_cookies:
             diffs["new_cookies"] = (set(), new_cookies)
 
-        # Cache header changes (important for cache poisoning)
-        for h in ("cache_control", "vary", "x_cache", "age", "etag"):
+        # Cache header changes (important for cache poisoning). NOTE: `age` is
+        # deliberately excluded — it's the seconds-in-cache counter, which
+        # increments on essentially every request to a CDN-fronted origin, so
+        # comparing it by equality flags every probed parameter. Real
+        # cache-key influence shows up in vary/cache-control/x-cache (and the
+        # body), not in a monotonic timer.
+        for h in ("cache_control", "vary", "x_cache", "etag"):
             if baseline.get(h) != test.get(h):
                 diffs[f"cache_{h}"] = (baseline.get(h), test.get(h))
 
         # Content type change
         if baseline["content_type"] != test["content_type"]:
             diffs["content_type"] = (baseline["content_type"], test["content_type"])
+
+        # Drop any fields that were already volatile between two identical
+        # baseline requests (nonces, timestamps, rotating headers, ...).
+        volatile = baseline.get("_volatile")
+        if volatile:
+            for key in volatile:
+                diffs.pop(key, None)
 
         return diffs
 
@@ -380,8 +408,8 @@ class ParamMiner(BaseScanner):
         """Classify a discovered parameter based on response changes."""
         name_lower = name.lower()
 
-        # Check for cache-related changes
-        cache_keys = {"cache_cache_control", "cache_vary", "cache_x_cache", "cache_age", "cache_etag"}
+        # Check for cache-related changes (age excluded — see _responses_differ)
+        cache_keys = {"cache_cache_control", "cache_vary", "cache_x_cache", "cache_etag"}
         if cache_keys & set(diffs.keys()):
             return ParamType.CACHE_POISON
 
