@@ -356,30 +356,6 @@ on its own using 10 built-in tools.
   • Error-based probing
   • Attack chain reasoning
 """,
-    "bounty-hunt": """
-[bright_yellow]💰 BOUNTY-HUNT — Full Bug Bounty Pipeline[/bright_yellow]
-
-[bold]The whole enchilada.[/bold] OWASP Top 10 scanning with validation.
-Runs IDOR, auth, injection, redirect, SSRF, and takeover scanners,
-then validates all findings through ImpactValidator + ReadinessGate.
-
-[bold cyan]USAGE:[/bold cyan]
-  beatrix bounty-hunt TARGET [OPTIONS]
-
-[bold cyan]OPTIONS:[/bold cyan]
-  -H, --header TEXT    Add header (format: "Name: Value"), repeatable
-  -u, --urls TEXT      Additional URL paths to scan (repeatable)
-  --jwt TEXT           JWT tokens to analyze (repeatable)
-  -o, --output PATH    Output report filename
-  -v, --verbose        Verbose output
-
-[bold cyan]EXAMPLES:[/bold cyan]
-  [dim]# Basic hunt[/dim]
-  beatrix bounty-hunt https://api.example.com
-
-  [dim]# With auth and extra endpoints[/dim]
-  beatrix bounty-hunt https://api.example.com -H "Authorization: Bearer TOKEN" -u /users/123 -u /orders/456
-""",
     "rapid": """
 [bright_yellow]⚡ RAPID — Multi-Target Quick Sweep[/bright_yellow]
 
@@ -794,7 +770,6 @@ def _show_quick_reference():
     table.add_row("probe TARGET", "Quick alive check", "beatrix probe example.com")
     table.add_row("recon DOMAIN", "Reconnaissance", "beatrix recon example.com --deep")
     table.add_row("batch FILE -m MOD", "Mass scanning", "beatrix batch targets.txt -m cors")
-    table.add_row("bounty-hunt TARGET", "OWASP Top 10 pipeline", "beatrix bounty-hunt https://api.com")
     table.add_row("rapid", "Multi-target quick sweep", "beatrix rapid -d target.com")
     table.add_row("haiku-hunt TARGET", "AI-assisted hunting", "beatrix haiku-hunt example.com")
     table.add_row("ghost TARGET", "AI autonomous pentester", "beatrix ghost https://api.com")
@@ -4709,30 +4684,6 @@ def polyglot_clobber(ctx, limit):
                 console.print(f"       [dim]{item['description']}[/dim]")
         else:
             console.print(f"  [dim]{i:3d}.[/dim] {item}")
-
-
-# =============================================================================
-# BOUNTY-HUNT — Full bounty pipeline
-# =============================================================================
-
-@cli.command("bounty-hunt")
-@click.argument("target")
-@click.option("--header", "-H", multiple=True, help='Add header (format: "Name: Value")')
-@click.option("--urls", "-u", multiple=True, help="Additional URL paths to scan")
-@click.option("--jwt", multiple=True, help="JWT tokens to analyze")
-@click.option("--output", "-o", type=click.Path(), help="Output report filename")
-@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
-@click.pass_context
-def bounty_hunt(ctx, target, header, urls, jwt, output, verbose):
-    """
-    Full OWASP Top 10 bug bounty hunt with validation.
-
-    \b
-    Run 'beatrix help bounty-hunt' for details.
-    """
-    console.print("[yellow]bounty-hunt is deprecated. Use 'beatrix hunt' instead:[/yellow]")
-    console.print(f"  beatrix hunt {target} --preset full")
-    sys.exit(1)
 
 
 # =============================================================================

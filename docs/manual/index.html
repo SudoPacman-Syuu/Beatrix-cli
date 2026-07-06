@@ -1158,20 +1158,6 @@ beatrix rapid -t bugbounty_targets.txt -o rapid_results.json</code></pre>
                 <!-- ═══════════ TIER 5: Advanced / AI ═══════════ -->
                 <h3>Tier 5: Advanced &amp; AI-Powered</h3>
 
-                <details id="cmd-bounty">
-                    <summary><s>bounty-hunt</s> — Deprecated</summary>
-                    <div class="detail-body">
-                        <p><strong>⚠️ This command has been deprecated.</strong> Use <code>beatrix hunt --preset full</code> instead, which provides the same full OWASP Top 10 pipeline with additional features including multi-target file input, AI-assisted analysis, authentication support, and configurable presets.</p>
-                        <pre><code># Old (deprecated):
-beatrix bounty-hunt https://target.com
-
-# New (use this instead):
-beatrix hunt https://target.com --preset full
-beatrix hunt https://target.com --preset full -o report.json
-beatrix hunt https://target.com --preset full --ai -H "Authorization: Bearer TOKEN"</code></pre>
-                    </div>
-                </details>
-
                 <details id="cmd-ghost">
                     <summary>ghost — AI Autonomous Penetration Tester</summary>
                     <div class="detail-body">

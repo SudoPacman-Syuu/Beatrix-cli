@@ -143,7 +143,6 @@ beatrix arsenal                      # full module reference
 | `probe TARGET` | Quick alive check | `beatrix probe example.com` |
 | `recon DOMAIN` | Reconnaissance only | `beatrix recon example.com --deep` |
 | `batch FILE -m MOD` | Mass single-module scanning | `beatrix batch targets.txt -m cors` |
-| `bounty-hunt TARGET` | OWASP Top 10 pipeline | `beatrix bounty-hunt https://api.com` |
 | `rapid` | Multi-target quick sweep | `beatrix rapid -d example.com` |
 | `haiku-hunt TARGET` | AI-assisted hunting | `beatrix haiku-hunt example.com` |
 | `ghost TARGET` | Autonomous AI pentester | `beatrix ghost https://api.com` |
@@ -754,7 +753,6 @@ beatrix                 # quick reference
 beatrix help hunt
 beatrix help strike
 beatrix help ghost
-beatrix help bounty-hunt
 beatrix arsenal         # full module reference
 beatrix list --modules
 beatrix list --presets
