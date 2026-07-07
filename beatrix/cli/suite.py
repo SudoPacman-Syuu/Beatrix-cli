@@ -3,14 +3,17 @@ Beatrix Suite — the central dashboard (`beatrix-suite`).
 
 One local server, one port, one browser tab. A Burp-Suite-style top tab bar
 switches between tools *inside the page* (client-side show/hide) instead of the
-old "one server + one port + one new tab per tool" pattern. v1 ships two tools:
+old "one server + one port + one new tab per tool" pattern.
 
-  * Auth  — the existing auth GUI, rendered inline in a same-origin ``<iframe>``
-            (its ``/api/*`` calls are mounted on this same server, so the whole
-            page is reused verbatim — see ``beatrix/cli/auth_gui.py``).
-  * Ghost — a target/objective form that launches a GHOST v2 investigation in a
-            background thread and streams its events inline (reusing the ghost
-            dashboard's ``_Broker`` event model — see ``beatrix/cli/ghost_web.py``).
+Layout:
+  * Left rail  — Projects: numbered workspaces the user switches between (each
+                 sections off its own scan data / scope). "+" creates a project;
+                 right-click a project -> Delete.
+  * Top tabs   — Tools within the active project:
+      - Auth   — the existing auth GUI, rendered inline in a same-origin
+                 ``<iframe>`` (its ``/api/*`` calls are mounted on this server).
+      - Ghost  — a target/objective form that launches a GHOST v2 investigation
+                 in a background thread and streams its events inline.
 
 Everything is stdlib ``http.server`` — no web-framework dependency, same toolkit
 as the two GUIs it unifies. Only one ``webbrowser.open`` ever fires, at launch.
@@ -20,10 +23,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
 # Reuse the auth GUI wholesale: its self-contained page + the exact backend
@@ -43,6 +49,7 @@ from beatrix.cli.auth_gui import (
 from beatrix.cli.ghost_web import _Broker
 
 DEFAULT_PORT = 8790
+DEFAULT_STATE_DIR = Path.home() / ".beatrix" / "suite"
 
 # Auth route -> backend fn, mirroring auth_gui._Handler exactly.
 _AUTH_GET = {
@@ -59,9 +66,101 @@ _AUTH_POST = {
 }
 
 
+# ── Projects ─────────────────────────────────────────────────────────────────
+class _ProjectStore:
+    """Persistent list of projects (workspaces) the dashboard switches between.
+
+    v1: projects are numerically labeled in creation order, persisted to
+    ``<state_dir>/projects.json``; each gets its own workspace dir under
+    ``<state_dir>/projects/<id>/`` (the future home for that project's scan
+    data / output / scope). IDs are monotonic (never reused), so a label always
+    identifies the same project even after deletions. At least one project
+    always exists — deleting the last one re-seeds a fresh one.
+    """
+
+    def __init__(self, state_dir: Path):
+        self.root = Path(state_dir)
+        self.file = self.root / "projects.json"
+        self._lock = threading.Lock()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._data = self._read()
+        if not self._data["projects"]:
+            self._create_locked()
+            self._write()
+
+    # ── persistence ──────────────────────────────────────────────────────
+    def _read(self) -> Dict[str, Any]:
+        try:
+            d = json.loads(self.file.read_text())
+            d.setdefault("projects", [])
+            d.setdefault("active", None)
+            d.setdefault("next_id", 1)
+            return d
+        except Exception:
+            return {"projects": [], "active": None, "next_id": 1}
+
+    def _write(self) -> None:
+        try:
+            self.file.write_text(json.dumps(self._data, indent=2))
+        except Exception:
+            pass
+
+    def _proj_dir(self, pid: int) -> Path:
+        return self.root / "projects" / str(pid)
+
+    def _create_locked(self) -> Dict[str, Any]:
+        """Append a new project + make it active. Caller holds the lock."""
+        pid = self._data["next_id"]
+        self._data["next_id"] = pid + 1
+        proj = {"id": pid, "name": f"Project {pid}", "created_at": time.time()}
+        self._data["projects"].append(proj)
+        self._data["active"] = pid
+        try:
+            self._proj_dir(pid).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return proj
+
+    # ── API ──────────────────────────────────────────────────────────────
+    def state(self) -> Dict[str, Any]:
+        with self._lock:
+            return {"projects": list(self._data["projects"]), "active": self._data["active"]}
+
+    def new(self) -> Dict[str, Any]:
+        with self._lock:
+            self._create_locked()
+            self._write()
+            return {"ok": True, "projects": list(self._data["projects"]),
+                    "active": self._data["active"]}
+
+    def select(self, pid: Any) -> Dict[str, Any]:
+        with self._lock:
+            if any(p["id"] == pid for p in self._data["projects"]):
+                self._data["active"] = pid
+                self._write()
+                return {"ok": True, "active": pid}
+            return {"ok": False, "error": "no such project"}
+
+    def delete(self, pid: Any) -> Dict[str, Any]:
+        with self._lock:
+            before = len(self._data["projects"])
+            self._data["projects"] = [p for p in self._data["projects"] if p["id"] != pid]
+            if len(self._data["projects"]) == before:
+                return {"ok": False, "error": "no such project"}
+            shutil.rmtree(self._proj_dir(pid), ignore_errors=True)
+            # Keep at least one project, and keep `active` valid.
+            if not self._data["projects"]:
+                self._create_locked()
+            elif self._data["active"] == pid:
+                self._data["active"] = self._data["projects"][0]["id"]
+            self._write()
+            return {"ok": True, "projects": list(self._data["projects"]),
+                    "active": self._data["active"]}
+
+
 # ── Shell page ───────────────────────────────────────────────────────────────
-# Top tab bar (Dashboard | Auth | Ghost); panes swap client-side. Theme-aware,
-# inline CSS/JS, no external requests.
+# Left project rail + top tab bar (Dashboard | Auth | Ghost); panes swap
+# client-side. Theme-aware, inline CSS/JS, no external requests.
 _PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -82,9 +181,26 @@ _PAGE = r"""<!doctype html>
     background:var(--panel); border-bottom:1px solid var(--border); }
   header .t { font-weight:700; font-size:15px; }
   header .t .g { color:var(--red); }
-  header .status { margin-left:auto; color:var(--muted); font-size:12px; }
+  header .proj-label { margin-left:auto; color:var(--muted); font-size:12px; }
+  header .status { color:var(--muted); font-size:12px; }
   .dot { width:9px; height:9px; border-radius:50%; display:inline-block; margin-right:6px;
     background:var(--green); vertical-align:middle; }
+
+  .body { flex:1; min-height:0; display:flex; }
+
+  /* Left project rail */
+  .projects { width:54px; flex-shrink:0; background:var(--panel); border-right:1px solid var(--border);
+    display:flex; flex-direction:column; align-items:center; gap:6px; padding:8px 0; overflow-y:auto; }
+  .proj { width:38px; height:38px; border-radius:8px; border:1px solid var(--border); background:var(--bg);
+    color:var(--muted); font:inherit; font-weight:700; cursor:pointer; flex-shrink:0;
+    display:flex; align-items:center; justify-content:center; }
+  .proj:hover { color:var(--fg); border-color:var(--accent); }
+  .proj.active { color:var(--fg); border-color:var(--accent); background:rgba(63,208,214,.12);
+    box-shadow:inset 3px 0 0 var(--accent); }
+  .proj.add { color:var(--muted); font-weight:400; font-size:20px; border-style:dashed; }
+  .proj.add:hover { color:var(--accent); }
+
+  .workspace { flex:1; min-width:0; display:flex; flex-direction:column; }
   nav { display:flex; gap:2px; padding:0 12px; background:var(--panel); border-bottom:1px solid var(--border); }
   nav button { font:inherit; font-size:13px; color:var(--muted); background:transparent; border:none;
     border-bottom:2px solid transparent; padding:9px 16px; cursor:pointer; }
@@ -95,6 +211,14 @@ _PAGE = r"""<!doctype html>
   .pane.active { display:block; }
   .pane.frame { overflow:hidden; }
   iframe { width:100%; height:100%; border:0; display:block; }
+
+  /* Right-click context menu for project tabs */
+  .ctx { position:fixed; z-index:50; display:none; background:var(--panel); border:1px solid var(--border);
+    border-radius:6px; padding:4px; min-width:130px; box-shadow:0 8px 24px rgba(0,0,0,.35); }
+  .ctx button { display:block; width:100%; text-align:left; font:inherit; font-size:13px; color:var(--red);
+    background:transparent; border:0; padding:6px 10px; border-radius:4px; cursor:pointer; }
+  .ctx button:hover { background:var(--bg); }
+
   .pad { padding:20px 24px; }
   h2 { font-size:16px; margin:0 0 8px; }
   p.sub { color:var(--muted); margin:0 0 18px; }
@@ -121,44 +245,50 @@ _PAGE = r"""<!doctype html>
 <body>
 <header>
   <span class="t">👻 <span class="g">Beatrix Suite</span></span>
+  <span class="proj-label" id="proj-label">—</span>
   <span class="status"><span class="dot"></span>connected</span>
 </header>
-<nav>
-  <button data-tab="dashboard" class="active">Dashboard</button>
-  <button data-tab="auth">Auth</button>
-  <button data-tab="ghost">Ghost</button>
-</nav>
-<main>
-  <section id="pane-dashboard" class="pane active">
-    <div class="pad">
-      <h2>Beatrix Suite</h2>
-      <p class="sub">One window. Pick a tool from the tabs above — it opens right here, no new tabs.</p>
-      <div class="card">
-        <b>Tools</b>
-        <ul style="margin:8px 0 0; padding-left:18px; color:var(--muted);">
-          <li><b>Auth</b> — import cookies / tokens / HAR, manage AI keys and the ghost2 model.</li>
-          <li><b>Ghost</b> — launch an autonomous GHOST v2 investigation and watch it live.</li>
-        </ul>
-      </div>
-    </div>
-  </section>
+<div class="body">
+  <aside id="projects" class="projects"></aside>
+  <div class="workspace">
+    <nav>
+      <button data-tab="dashboard" class="active">Dashboard</button>
+      <button data-tab="auth">Auth</button>
+      <button data-tab="ghost">Ghost</button>
+    </nav>
+    <main>
+      <section id="pane-dashboard" class="pane active">
+        <div class="pad">
+          <h2>Beatrix Suite</h2>
+          <p class="sub">Active project: <b id="dash-project">—</b> · pick a tool from the tabs above.</p>
+          <div class="card">
+            <b>Projects</b>
+            <p style="margin:6px 0 0; color:var(--muted);">Use the left rail to switch workspaces.
+              <b>+</b> creates a project; right-click a project to delete it. Each project keeps its
+              own scan data and scope separate.</p>
+          </div>
+        </div>
+      </section>
 
-  <section id="pane-auth" class="pane frame"></section>
+      <section id="pane-auth" class="pane frame"></section>
 
-  <section id="pane-ghost" class="pane">
-    <div class="pad">
-      <h2>Ghost — autonomous investigation</h2>
-      <p class="sub">Enter a target and run. Events stream below in real time.</p>
-      <div class="row">
-        <div><label>Target</label><input id="g-target" type="text" placeholder="https://example.com"></div>
-        <div><label>Objective (optional)</label><input id="g-obj" type="text" placeholder="Find and validate security vulnerabilities."></div>
-        <button id="g-run" class="run">Run</button>
-      </div>
-      <div id="g-msg" style="color:var(--muted); font-size:12px;"></div>
-      <div id="ghost-log"></div>
-    </div>
-  </section>
-</main>
+      <section id="pane-ghost" class="pane">
+        <div class="pad">
+          <h2>Ghost — autonomous investigation</h2>
+          <p class="sub">Enter a target and run. Events stream below in real time.</p>
+          <div class="row">
+            <div><label>Target</label><input id="g-target" type="text" placeholder="https://example.com"></div>
+            <div><label>Objective (optional)</label><input id="g-obj" type="text" placeholder="Find and validate security vulnerabilities."></div>
+            <button id="g-run" class="run">Run</button>
+          </div>
+          <div id="g-msg" style="color:var(--muted); font-size:12px;"></div>
+          <div id="ghost-log"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+<div id="ctxmenu" class="ctx"><button id="ctx-del">Delete project</button></div>
 <script>
 const TAGS = { thinking:"🧠 thinking", system_prompt:"📋 system", prompt:"📤 prompt",
   reasoning:"💭 reasoning", tool_start:"🔧 tool", tool_end:"↳ result", agent_start:"▶ agent",
@@ -212,20 +342,79 @@ $("g-run").onclick = async () => {
     polling = true; poll();
   } catch (e) { $("g-msg").textContent = "Error: " + e; $("g-run").disabled = false; }
 };
+
+// ── Projects: left rail (switch / create / delete) ──
+let projects = [], activeProject = null;
+function renderProjects() {
+  const rail = $("projects"); rail.innerHTML = "";
+  for (const p of projects) {
+    const b = document.createElement("button");
+    b.className = "proj" + (p.id === activeProject ? " active" : "");
+    b.textContent = p.id; b.title = p.name;
+    b.onclick = () => selectProject(p.id);
+    b.oncontextmenu = (e) => { e.preventDefault(); showCtx(e, p.id); };
+    rail.appendChild(b);
+  }
+  const add = document.createElement("button");
+  add.className = "proj add"; add.textContent = "+"; add.title = "New project";
+  add.onclick = newProject;
+  rail.appendChild(add);
+  const ap = projects.find(p => p.id === activeProject);
+  $("proj-label").textContent = ap ? ap.name : "—";
+  $("dash-project").textContent = ap ? ap.name : "—";
+}
+function applyState(d) { projects = d.projects || []; activeProject = d.active; renderProjects(); }
+async function loadProjects() { applyState(await (await fetch("/projects")).json()); }
+async function selectProject(id) {
+  if (id === activeProject) return;
+  await fetch("/projects/select", { method:"POST", body: JSON.stringify({ id }) });
+  activeProject = id; renderProjects(); onProjectSwitch();
+}
+async function newProject() {
+  applyState(await (await fetch("/projects/new", { method:"POST", body:"{}" })).json());
+  onProjectSwitch();
+}
+async function deleteProject(id) {
+  const d = await (await fetch("/projects/delete", { method:"POST", body: JSON.stringify({ id }) })).json();
+  if (d.ok) { applyState(d); onProjectSwitch(); }
+}
+function onProjectSwitch() {
+  // Reset the per-project tool views. (Wiring scan data/scope to the active
+  // project's workspace dir is the next iteration.)
+  $("ghost-log").innerHTML = ""; since = 0; polling = false;
+  $("g-msg").textContent = ""; $("g-run").disabled = false;
+}
+
+// Context menu
+function showCtx(e, id) {
+  const m = $("ctxmenu");
+  m.style.display = "block"; m.style.left = e.clientX + "px"; m.style.top = e.clientY + "px";
+  m.dataset.pid = id;
+}
+document.addEventListener("click", () => { $("ctxmenu").style.display = "none"; });
+$("ctx-del").onclick = () => {
+  const id = parseInt($("ctxmenu").dataset.pid, 10);
+  $("ctxmenu").style.display = "none";
+  deleteProject(id);
+};
+
+loadProjects();
 </script>
 </body>
 </html>"""
 
 
 class SuiteServer:
-    """The single central-dashboard server. One port, all tools."""
+    """The single central-dashboard server. One port, all tools + projects."""
 
-    def __init__(self, host: str = "0.0.0.0", port: int = DEFAULT_PORT):
+    def __init__(self, host: str = "0.0.0.0", port: int = DEFAULT_PORT,
+                 state_dir: Optional[Path] = None):
         self.host = host
         self.port = port
         self._httpd: Optional[ThreadingHTTPServer] = None
         self.url: str = ""
         self.public_url: Optional[str] = None
+        self.projects = _ProjectStore(Path(state_dir) if state_dir else DEFAULT_STATE_DIR)
         # At most one ghost run at a time in v1; its event broker lives here.
         self.ghost_broker: Optional[_Broker] = None
         self._lock = threading.Lock()
@@ -310,6 +499,8 @@ class SuiteServer:
                     # Existing auth GUI, verbatim, same origin (its /api/* calls
                     # resolve to the handlers below).
                     self._send(200, _AUTH_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+                elif path == "/projects":
+                    self._json(suite.projects.state())
                 elif path in _AUTH_GET:
                     try:
                         result = _AUTH_GET[path]()
@@ -343,6 +534,12 @@ class SuiteServer:
                 elif path == "/ghost/run":
                     self._json(suite.start_ghost_run(
                         payload.get("target", ""), payload.get("objective", "")))
+                elif path == "/projects/new":
+                    self._json(suite.projects.new())
+                elif path == "/projects/select":
+                    self._json(suite.projects.select(payload.get("id")))
+                elif path == "/projects/delete":
+                    self._json(suite.projects.delete(payload.get("id")))
                 else:
                     self._send(404, b"not found", "text/plain")
 
@@ -390,7 +587,6 @@ def main(host: str = "0.0.0.0", port: int = DEFAULT_PORT, open_browser: bool = T
     print("Press Ctrl-C to stop.", flush=True)
     try:
         while True:
-            import time
             time.sleep(0.5)
     except KeyboardInterrupt:
         pass

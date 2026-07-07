@@ -16,12 +16,13 @@ import urllib.request
 import pytest
 
 from beatrix.cli.ghost_web import _Broker
-from beatrix.cli.suite import _AUTH_GET, _AUTH_POST, SuiteServer
+from beatrix.cli.suite import _AUTH_GET, _AUTH_POST, _ProjectStore, SuiteServer
 
 
 @pytest.fixture
-def server():
-    srv = SuiteServer(host="127.0.0.1", port=0)
+def server(tmp_path):
+    # Isolate the project store from the real ~/.beatrix/suite.
+    srv = SuiteServer(host="127.0.0.1", port=0, state_dir=tmp_path / "suite")
     srv.start(open_browser=False)
     try:
         yield srv
@@ -120,3 +121,81 @@ def test_unknown_route_404s(server):
     with pytest.raises(urllib.error.HTTPError) as exc:
         _get(server, "/nope")
     assert exc.value.code == 404
+
+
+# ── Projects rail: create / switch / delete over HTTP ───────────────────
+def test_projects_seeded_with_one_active(server):
+    code, body = _get(server, "/projects")
+    assert code == 200
+    d = json.loads(body)
+    assert len(d["projects"]) == 1
+    assert d["projects"][0]["id"] == 1 and d["projects"][0]["name"] == "Project 1"
+    assert d["active"] == 1
+
+
+def test_projects_created_numerically_and_active(server):
+    _, d2 = _post(server, "/projects/new", {})
+    assert [p["id"] for p in d2["projects"]] == [1, 2]
+    assert d2["active"] == 2  # newest becomes active
+    _, d3 = _post(server, "/projects/new", {})
+    assert [p["name"] for p in d3["projects"]] == ["Project 1", "Project 2", "Project 3"]
+
+
+def test_project_select_switches_active(server):
+    _post(server, "/projects/new", {})           # -> active 2
+    _, r = _post(server, "/projects/select", {"id": 1})
+    assert r == {"ok": True, "active": 1}
+    assert json.loads(_get(server, "/projects")[1])["active"] == 1
+
+
+def test_project_delete_removes_and_fixes_active(server):
+    _post(server, "/projects/new", {})           # 2 (active)
+    _post(server, "/projects/new", {})           # 3 (active)
+    _, r = _post(server, "/projects/delete", {"id": 3})
+    assert r["ok"] is True
+    assert [p["id"] for p in r["projects"]] == [1, 2]
+    assert r["active"] == 1  # active fell back off the deleted one
+
+
+def test_ids_are_stable_after_delete(server):
+    _post(server, "/projects/new", {})           # 2
+    _post(server, "/projects/new", {})           # 3
+    _post(server, "/projects/delete", {"id": 2})  # gap: [1, 3]
+    ids = [p["id"] for p in json.loads(_get(server, "/projects")[1])["projects"]]
+    assert ids == [1, 3]                          # not renumbered
+    _, d = _post(server, "/projects/new", {})     # next monotonic id
+    assert d["projects"][-1]["id"] == 4
+
+
+def test_deleting_last_project_reseeds(server):
+    _, r = _post(server, "/projects/delete", {"id": 1})
+    assert r["ok"] is True
+    assert len(r["projects"]) == 1                # never empty
+    assert r["active"] == r["projects"][0]["id"]
+
+
+def test_delete_unknown_project_is_noop(server):
+    _, r = _post(server, "/projects/delete", {"id": 999})
+    assert r["ok"] is False
+
+
+def test_projects_persist_across_restart(tmp_path):
+    sd = tmp_path / "suite"
+    s1 = SuiteServer(host="127.0.0.1", port=0, state_dir=sd)
+    s1.start(open_browser=False)
+    try:
+        _post(s1, "/projects/new", {})            # now [1, 2]
+    finally:
+        s1.stop()
+    # New server instance, same state dir -> projects survive.
+    store = _ProjectStore(sd)
+    st = store.state()
+    assert [p["id"] for p in st["projects"]] == [1, 2]
+
+
+def test_project_workspace_dir_created_and_removed(tmp_path):
+    store = _ProjectStore(tmp_path / "suite")
+    store.new()  # id 2
+    assert (tmp_path / "suite" / "projects" / "2").is_dir()
+    store.delete(2)
+    assert not (tmp_path / "suite" / "projects" / "2").exists()
