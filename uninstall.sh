@@ -53,11 +53,13 @@ if [[ -n "${_beatrix_cfg_backup:-}" ]]; then
     echo -e "  ${GREEN}✓${RESET} Config preserved"
 fi
 
-# Wrapper script
-if [[ -f "$INSTALL_DIR/beatrix" ]] || [[ -L "$INSTALL_DIR/beatrix" ]]; then
-    sudo rm -f "$INSTALL_DIR/beatrix"
-    echo -e "  ${GREEN}✓${RESET} Removed $INSTALL_DIR/beatrix"
-fi
+# Wrapper scripts (beatrix + beatrix-suite)
+for _bin in beatrix beatrix-suite; do
+    if [[ -f "$INSTALL_DIR/$_bin" ]] || [[ -L "$INSTALL_DIR/$_bin" ]]; then
+        sudo rm -f "$INSTALL_DIR/$_bin"
+        echo -e "  ${GREEN}✓${RESET} Removed $INSTALL_DIR/$_bin"
+    fi
+done
 
 echo ""
 echo -e "${GREEN}${BOLD}Beatrix CLI has been uninstalled.${RESET}"

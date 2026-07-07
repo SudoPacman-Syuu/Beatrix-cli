@@ -60,6 +60,7 @@ agent = [
 
 [project.scripts]
 beatrix = "beatrix.cli.main:cli"
+beatrix-suite = "beatrix.cli.suite:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -4884,6 +4884,26 @@ def ghost(ctx, target, objective, method, header, data, max_turns, model, api_ke
         sys.exit(1)
 
 
+@cli.command("suite")
+@click.option("--port", type=int, default=8790, help="Port to serve the dashboard on (default: 8790)")
+@click.option("--host", default="0.0.0.0", help="Interface to bind (default: 0.0.0.0)")
+@click.option("--no-browser", is_flag=True, help="Don't try to open a browser automatically")
+def suite(port, host, no_browser):
+    """Open the Beatrix Suite central dashboard (also: `beatrix-suite`).
+
+    \b
+    One local server, one browser tab. A top tab bar switches between tools
+    (Auth, Ghost, ...) inside the page — no new tabs or ports per tool. Works in
+    Codespaces / remote containers via port-forwarding.
+    """
+    from beatrix.cli.suite import main as suite_main
+    try:
+        suite_main(host=host, port=port, open_browser=not no_browser)
+    except OSError as e:
+        console.print(f"[red]Could not start Suite on {host}:{port} — {e}[/red]")
+        console.print("[dim]Try a different port: beatrix suite --port 8899[/dim]")
+
+
 @cli.command("ghost2")
 @click.argument("target")
 @click.option("--objective", "-o", default="Find and validate security vulnerabilities.",
