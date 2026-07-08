@@ -73,15 +73,17 @@ def test_auth_routes_match_standalone_gui():
     assert set(_AUTH_POST) == {"/api/save", "/api/clear", "/api/keys", "/api/model"}
 
 
-# ── Ghost tool: run validation + event streaming ────────────────────────
+# ── Ghost tool: run validation + event streaming (per-project) ──────────
 def test_ghost_events_empty_before_any_run(server):
-    code, body = _get(server, "/ghost/events?since=0")
+    # No broker yet for this project => reported "done" so a client never
+    # sits in an infinite poll loop for a project that never ran anything.
+    code, body = _get(server, "/ghost/events?since=0&project=1")
     assert code == 200
-    assert json.loads(body) == {"events": [], "done": False}
+    assert json.loads(body) == {"events": [], "done": True}
 
 
 def test_ghost_run_rejects_empty_target(server):
-    code, result = _post(server, "/ghost/run", {"target": "  "})
+    code, result = _post(server, "/ghost/run", {"target": "  ", "project": 1})
     assert code == 200
     assert result["ok"] is False and "target" in result["error"].lower()
 
@@ -90,31 +92,68 @@ def test_ghost_events_stream_from_broker(server):
     # Simulate a run's broker (what run_investigation's on_event feeds) and
     # confirm the /ghost/events contract the page polls.
     b = _Broker(meta={"target": "https://x"})
-    server.ghost_broker = b
+    server.ghost_brokers["1"] = b
     b.emit({"type": "agent_start", "text": "GHOST engaged"})
     b.emit({"type": "finding", "text": "SQLi", "detail": "id param"})
 
-    code, body = _get(server, "/ghost/events?since=0")
+    code, body = _get(server, "/ghost/events?since=0&project=1")
     data = json.loads(body)
     assert [e["type"] for e in data["events"]] == ["agent_start", "finding"]
     assert data["done"] is False
 
     # `since` cursor only returns newer events.
     last = data["events"][-1]["seq"]
-    _, body2 = _get(server, "/ghost/events?since=%d" % last)
+    _, body2 = _get(server, "/ghost/events?since=%d&project=1" % last)
     assert json.loads(body2)["events"] == []
 
     b.finish()
-    _, body3 = _get(server, "/ghost/events?since=0")
+    _, body3 = _get(server, "/ghost/events?since=0&project=1")
     assert json.loads(body3)["done"] is True
 
 
 def test_ghost_state_reflects_current_run(server):
-    assert _get(server, "/ghost/state")[0] == 200
-    assert json.loads(_get(server, "/ghost/state")[1]) == {}  # no run yet
-    server.ghost_broker = _Broker(meta={"target": "https://x", "model": "m"})
-    state = json.loads(_get(server, "/ghost/state")[1])
+    assert _get(server, "/ghost/state?project=1")[0] == 200
+    assert json.loads(_get(server, "/ghost/state?project=1")[1]) == {}  # no run yet
+    server.ghost_brokers["1"] = _Broker(meta={"target": "https://x", "model": "m"})
+    state = json.loads(_get(server, "/ghost/state?project=1")[1])
     assert state["target"] == "https://x" and state["model"] == "m"
+    assert state["running"] is True  # broker not finished yet
+
+
+def test_ghost_events_isolated_between_projects(server):
+    # This is the exact bug: project 1 has a run streaming; switching to /
+    # creating project 2 must NOT clobber or hide project 1's events.
+    b1 = _Broker(meta={"target": "https://one.com"})
+    server.ghost_brokers["1"] = b1
+    b1.emit({"type": "agent_start", "text": "GHOST engaged"})
+    b1.emit({"type": "finding", "text": "SQLi on one.com"})
+
+    # A second project is created and has never run anything.
+    code, d2 = _post(server, "/projects/new", {})
+    new_id = d2["projects"][-1]["id"]
+    assert json.loads(_get(server, "/ghost/state?project=%d" % new_id)[1]) == {}
+
+    # Project 1's stream is completely unaffected by project 2 existing/being active.
+    data = json.loads(_get(server, "/ghost/events?since=0&project=1")[1])
+    assert [e["type"] for e in data["events"]] == ["agent_start", "finding"]
+    state1 = json.loads(_get(server, "/ghost/state?project=1")[1])
+    assert state1["target"] == "https://one.com" and state1["running"] is True
+
+
+def test_ghost_run_defaults_to_active_project_when_unspecified(server):
+    # Client omits `project` -> server uses the currently active project.
+    _post(server, "/projects/select", {"id": 1})
+    code, result = _post(server, "/ghost/run", {"target": ""})  # empty target, no project
+    assert result["ok"] is False  # still validates target; proves the route was reached
+
+    assert json.loads(_get(server, "/ghost/events?since=0")[1]) == {"events": [], "done": True}
+
+
+def test_ghost_run_rejects_concurrent_run_on_same_project(server):
+    server.ghost_brokers["1"] = _Broker(meta={"target": "https://x"})  # still running
+    code, result = _post(server, "/ghost/run", {"target": "https://y", "project": 1})
+    assert result["ok"] is False
+    assert "already running" in result["error"].lower()
 
 
 def test_unknown_route_404s(server):

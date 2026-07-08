@@ -310,8 +310,12 @@ document.querySelectorAll("nav button").forEach(btn => {
   };
 });
 
-// ── Ghost: launch a run, then poll its event stream inline ──
-let since = 0, polling = false;
+// ── Ghost: each project has its OWN run + event stream on the server.
+// `pollProject` is the project id the in-flight poll loop belongs to; every
+// poll checks it's still current before rendering or rescheduling, so a run
+// left going in another project can never leak into (or get cut off by
+// switching away from) the one currently on screen.
+let since = 0, pollProject = null;
 function renderEvent(ev) {
   const d = document.createElement("div");
   d.className = "ev " + ev.type;
@@ -321,25 +325,50 @@ function renderEvent(ev) {
   d.innerHTML = html;
   $("ghost-log").appendChild(d);
 }
-async function poll() {
+async function poll(id) {
+  if (id !== pollProject) return;               // a different project is on screen now
+  let r;
   try {
-    const r = await (await fetch("/ghost/events?since=" + since)).json();
-    for (const ev of r.events) { renderEvent(ev); since = ev.seq; }
-    $("ghost-log").scrollTop = $("ghost-log").scrollHeight;
-    if (r.done) { polling = false; $("g-run").disabled = false; $("g-msg").textContent = "Run finished."; return; }
-  } catch (e) { /* server gone — stop quietly */ }
-  if (polling) setTimeout(poll, 600);
+    r = await (await fetch("/ghost/events?since=" + since + "&project=" + id)).json();
+  } catch (e) { setTimeout(() => poll(id), 600); return; }
+  if (id !== pollProject) return;                // switched away while this fetch was in flight
+  for (const ev of r.events) { renderEvent(ev); since = ev.seq; }
+  $("ghost-log").scrollTop = $("ghost-log").scrollHeight;
+  if (r.done) { $("g-run").disabled = false; $("g-msg").textContent = "Run finished."; return; }
+  $("g-run").disabled = true;
+  setTimeout(() => poll(id), 600);
+}
+// Rebuild the Ghost pane for `id`: clear the shared log DOM, then replay that
+// project's own event history from the server (not from memory — the whole
+// point is this survives having been switched away from) and resume polling
+// if it's still running.
+async function loadGhostViewFor(id) {
+  $("ghost-log").innerHTML = ""; since = 0;
+  pollProject = id;
+  $("g-run").disabled = false; $("g-msg").textContent = "";
+  let st = {};
+  try { st = await (await fetch("/ghost/state?project=" + id)).json(); } catch (e) {}
+  if (id !== pollProject) return;                 // switched again while loading
+  if (st && st.target) {
+    $("g-target").value = st.target;
+    $("g-obj").value = st.objective || "";
+    $("g-msg").textContent = st.running ? "Running: " + st.target : "Run finished.";
+    poll(id);                                     // replays history; keeps going if still running
+  } else {
+    $("g-target").value = ""; $("g-obj").value = "";
+  }
 }
 $("g-run").onclick = async () => {
   const target = $("g-target").value.trim();
   if (!target) { $("g-msg").textContent = "Enter a target first."; return; }
-  $("g-run").disabled = true; $("g-msg").textContent = "Starting…"; $("ghost-log").innerHTML = ""; since = 0;
+  $("g-run").disabled = true; $("g-msg").textContent = "Starting…";
+  $("ghost-log").innerHTML = ""; since = 0; pollProject = activeProject;
   try {
     const r = await (await fetch("/ghost/run", { method:"POST",
-      body: JSON.stringify({ target, objective: $("g-obj").value.trim() }) })).json();
+      body: JSON.stringify({ target, objective: $("g-obj").value.trim(), project: activeProject }) })).json();
     if (!r.ok) { $("g-msg").textContent = "Error: " + (r.error || "could not start"); $("g-run").disabled = false; return; }
     $("g-msg").textContent = "Running: " + target;
-    polling = true; poll();
+    poll(activeProject);
   } catch (e) { $("g-msg").textContent = "Error: " + e; $("g-run").disabled = false; }
 };
 
@@ -379,10 +408,9 @@ async function deleteProject(id) {
   if (d.ok) { applyState(d); onProjectSwitch(); }
 }
 function onProjectSwitch() {
-  // Reset the per-project tool views. (Wiring scan data/scope to the active
-  // project's workspace dir is the next iteration.)
-  $("ghost-log").innerHTML = ""; since = 0; polling = false;
-  $("g-msg").textContent = ""; $("g-run").disabled = false;
+  // Rebuild (never just clear) the per-project tool views from server state,
+  // so a run left going in another project stays visible when you switch back.
+  loadGhostViewFor(activeProject);
 }
 
 // Context menu
@@ -398,7 +426,7 @@ $("ctx-del").onclick = () => {
   deleteProject(id);
 };
 
-loadProjects();
+loadProjects().then(() => loadGhostViewFor(activeProject));  // restore any run in progress on load/refresh
 </script>
 </body>
 </html>"""
@@ -415,20 +443,37 @@ class SuiteServer:
         self.url: str = ""
         self.public_url: Optional[str] = None
         self.projects = _ProjectStore(Path(state_dir) if state_dir else DEFAULT_STATE_DIR)
-        # At most one ghost run at a time in v1; its event broker lives here.
-        self.ghost_broker: Optional[_Broker] = None
+        # One ghost run + event broker PER project (keyed by str(project id)), so
+        # switching projects preserves each project's live run view.
+        self.ghost_brokers: Dict[str, _Broker] = {}
         self._lock = threading.Lock()
 
     # ── Ghost run lifecycle ──────────────────────────────────────────────
-    def start_ghost_run(self, target: str, objective: str) -> Dict[str, Any]:
-        """Launch a GHOST v2 investigation in a background thread.
+    def start_ghost_run(self, target: str, objective: str, project_id: Any) -> Dict[str, Any]:
+        """Launch a GHOST v2 investigation in a background thread, scoped to
+        ``project_id``.
 
-        Returns an ack dict; run output is streamed via ``self.ghost_broker``.
+        Each project keeps its own event broker (keyed by ``str(project_id)``)
+        so switching projects never loses or clobbers another project's live
+        run view — that was the v1 bug: a single shared broker meant creating
+        or switching to a different project blew away whatever the previous
+        project's run had streamed, even though the run itself kept going.
+
+        Returns an ack dict; run output is streamed via that project's broker.
         Guards the ``[agent]`` extra + missing-API-key the same way the CLI does.
         """
         target = (target or "").strip()
         if not target:
             return {"ok": False, "error": "target required"}
+
+        key = str(project_id)
+        with self._lock:
+            existing = self.ghost_brokers.get(key)
+            # since(<huge>) is a read-only way to ask "is this broker done?"
+            # without reaching into _Broker's private _done attribute.
+            if existing is not None and not existing.since(10**9)["done"]:
+                return {"ok": False, "error": "A scan is already running for this project."}
+
         try:
             from beatrix.ai.ghost2.config import GhostV2Config
             from beatrix.ai.ghost2.core.runner import run_investigation
@@ -445,7 +490,7 @@ class SuiteServer:
         broker = _Broker(meta={"target": target, "model": cfg.model,
                                "objective": objective, "auth": "none"})
         with self._lock:
-            self.ghost_broker = broker
+            self.ghost_brokers[key] = broker
 
         def _run() -> None:
             import asyncio
@@ -465,13 +510,19 @@ class SuiteServer:
         threading.Thread(target=_run, daemon=True).start()
         return {"ok": True, "target": target}
 
-    def ghost_events(self, since: int) -> Dict[str, Any]:
-        b = self.ghost_broker
-        return b.since(since) if b is not None else {"events": [], "done": False}
+    def ghost_events(self, since: int, project_id: Any) -> Dict[str, Any]:
+        b = self.ghost_brokers.get(str(project_id))
+        # No broker for this project => nothing has run there; report "done"
+        # so a client never sits in a poll loop for a project with no run.
+        return b.since(since) if b is not None else {"events": [], "done": True}
 
-    def ghost_state(self) -> Dict[str, Any]:
-        b = self.ghost_broker
-        return dict(b.meta) if b is not None else {}
+    def ghost_state(self, project_id: Any) -> Dict[str, Any]:
+        b = self.ghost_brokers.get(str(project_id))
+        if b is None:
+            return {}
+        state = dict(b.meta)
+        state["running"] = not b.since(10**9)["done"]
+        return state
 
     # ── HTTP ─────────────────────────────────────────────────────────────
     def start(self, open_browser: bool = True) -> str:
@@ -510,9 +561,16 @@ class SuiteServer:
                 elif path == "/ghost/events":
                     q = parse_qs(urlparse(self.path).query)
                     since = int((q.get("since") or ["0"])[0])
-                    self._json(suite.ghost_events(since))
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.ghost_events(since, proj))
                 elif path == "/ghost/state":
-                    self._json(suite.ghost_state())
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.ghost_state(proj))
                 else:
                     self._send(404, b"not found", "text/plain")
 
@@ -532,8 +590,11 @@ class SuiteServer:
                         result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
                     self._json(result)
                 elif path == "/ghost/run":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
                     self._json(suite.start_ghost_run(
-                        payload.get("target", ""), payload.get("objective", "")))
+                        payload.get("target", ""), payload.get("objective", ""), proj))
                 elif path == "/projects/new":
                     self._json(suite.projects.new())
                 elif path == "/projects/select":
