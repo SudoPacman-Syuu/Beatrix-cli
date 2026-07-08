@@ -307,6 +307,7 @@ class BeatrixEngine:
         modules: Optional[List[str]] = None,
         auth: Optional[Any] = None,
         browser_auth: bool = False,
+        scope: Optional[List[str]] = None,
     ) -> KillChainState:
         """
         Execute a hunt against a target.
@@ -325,6 +326,10 @@ class BeatrixEngine:
                 samples a fixed list of common auth-check paths, so it can
                 miss path-specific fingerprint blocking that a broader
                 scan would still hit.
+            scope: Hostname patterns (``example.com``, ``*.example.com``) the
+                crawler is allowed to follow links into, beyond the target's
+                own origin (see kill_chain's crawl phase). Leave unset to keep
+                the built-in default of the target domain and its subdomains.
 
         Returns:
             KillChainState with all findings
@@ -349,6 +354,8 @@ class BeatrixEngine:
             context["auth"] = auth
         if browser_auth:
             context["needs_browser_transport"] = True
+        if scope:
+            context["scope"] = scope
             context["force_browser_transport"] = True  # skip calibration override
 
         # Execute kill chain

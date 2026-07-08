@@ -76,6 +76,11 @@ async def run_scanner(ctx: RunContextWrapper[GhostSession], module: str, url: st
         url: Target URL to scan.
     """
     session = ctx.context
+    if not session.scope.in_scope(url):
+        return (
+            f"Refusing to scan '{url}': outside the authorized scope "
+            f"({', '.join(session.scope.allowed_hosts) or session.scope.host()})."
+        )
     registry = _registry()
     scanner = registry.get(module)
     if scanner is None:

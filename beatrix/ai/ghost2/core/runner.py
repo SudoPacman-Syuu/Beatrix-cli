@@ -23,12 +23,19 @@ async def run_investigation(
     objective: str = "Find and validate security vulnerabilities.",
     base_headers: Optional[Dict[str, str]] = None,
     base_cookies: Optional[Dict[str, str]] = None,
+    allowed_hosts: Optional[List[str]] = None,
     console: Any = None,
     verbose: bool = False,
     persist: bool = True,
     on_event: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Run a full GHOST v2 investigation against ``target``.
+
+    ``allowed_hosts``, if given, restricts every scope-checked tool
+    (``http_request``, ``inject``, ``run_scanner``, ``run_external_tool``) to
+    just those hosts (and their subdomains — see ``Scope.in_scope``) instead
+    of the default of just the target's own host. Leave unset to scan only
+    the target itself.
 
     Returns a result dict with the recorded findings, the agent's final
     summary, and (if persisted) the FindingsDB hunt id.
@@ -59,6 +66,7 @@ async def run_investigation(
         objective=objective,
         base_headers=base_headers or {},
         base_cookies=base_cookies or {},
+        allowed_hosts=allowed_hosts or [],
     )
     runtime = make_runtime(cfg, console=console)
     hooks = GhostHooks(

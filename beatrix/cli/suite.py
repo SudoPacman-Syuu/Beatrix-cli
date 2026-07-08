@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import threading
 import time
@@ -196,6 +197,76 @@ def _hunt_event_to_line(event: str, data: dict) -> Optional[Dict[str, str]]:
     return None
 
 
+# ── Scope parsing/matching (Burp-style target scope) ─────────────────────────
+_IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
+
+def _parse_scope_entry(raw: str) -> Optional[str]:
+    """Normalize one pasted scope line to a bare hostname/IP.
+
+    Accepts a full URL (``https://example.com/path``), a bare domain
+    (``example.com``), an already-wildcarded pattern (``*.example.com``), or a
+    bare IP — with or without a trailing path/port. Returns ``None`` for
+    blank/unparseable input.
+    """
+    raw = raw.strip()
+    if not raw:
+        return None
+    if "://" in raw:
+        host = urlparse(raw).hostname
+        return host.lower() if host else None
+    host = raw.split("/", 1)[0].split(":", 1)[0].strip()
+    return host.lower() or None
+
+
+def _is_ip_literal(host: str) -> bool:
+    return bool(_IPV4_RE.match(host)) or ":" in host  # crude-but-sufficient IPv6 check
+
+
+def _expand_for_crawler(hosts: List[str]) -> List[str]:
+    """Turn plain hostnames into crawler-compatible scope patterns.
+
+    ``TargetCrawler._hostname_in_scope`` only treats a pattern as covering
+    subdomains when it's explicitly written ``*.host`` — a bare ``host`` is an
+    exact match only there. ghost2's ``Scope.in_scope`` (used for the findings
+    backstop and Ghost's tool gating below) already treats every allowed host
+    as covering its own subdomains, so this expansion is crawler-specific.
+    """
+    patterns: List[str] = []
+    for h in hosts:
+        if h.startswith("*."):
+            patterns.append(h)
+            continue
+        patterns.append(h)
+        if not _is_ip_literal(h):
+            patterns.append(f"*.{h}")
+    return patterns
+
+
+def _host_in_scope(url_or_host: str, hosts: List[str]) -> bool:
+    """True if ``url_or_host`` matches one of ``hosts`` (or its subdomains).
+
+    Delegates to ghost2's own ``Scope.in_scope`` so matching semantics are
+    identical everywhere in the suite — the findings backstop filter here and
+    the tool-level gating in ghost2's http_tools/scanner_tool/external_tool —
+    instead of a second, possibly-drifting implementation.
+    """
+    from beatrix.ai.ghost2.core.session import Scope
+    return Scope(target="", allowed_hosts=hosts).in_scope(url_or_host)
+
+
+def _parse_scope_text(raw: str) -> List[str]:
+    """Split a pasted blob (newline/comma/whitespace-separated) into
+    normalized, deduplicated hostnames, dropping anything unparseable."""
+    parts = re.split(r"[\s,]+", raw or "")
+    seen: List[str] = []
+    for part in parts:
+        host = _parse_scope_entry(part)
+        if host and host not in seen:
+            seen.append(host)
+    return seen
+
+
 # ── Projects ─────────────────────────────────────────────────────────────────
 class _ProjectStore:
     """Persistent list of projects (workspaces) the dashboard switches between.
@@ -294,6 +365,49 @@ class _ProjectStore:
             self._write()
             return {"ok": True, "projects": list(self._data["projects"]),
                     "active": self._data["active"]}
+
+    # ── Scope (per project — separate from every other project's, like the
+    # scan data in workspace_dir()) ───────────────────────────────────────
+    def _find(self, pid: Any) -> Optional[Dict[str, Any]]:
+        # str() comparison: `pid` may arrive as an int (POST JSON body) or a
+        # str (parsed from a GET query string) — project ids are stored as int.
+        for p in self._data["projects"]:
+            if str(p["id"]) == str(pid):
+                return p
+        return None
+
+    def get_scope(self, pid: Any) -> List[str]:
+        with self._lock:
+            p = self._find(pid)
+            return list(p.get("scope", [])) if p else []
+
+    def add_scope(self, pid: Any, entries: List[str]) -> Dict[str, Any]:
+        with self._lock:
+            p = self._find(pid)
+            if p is None:
+                return {"ok": False, "error": "no such project"}
+            merged = set(p.get("scope", [])) | set(entries)
+            p["scope"] = sorted(merged)
+            self._write()
+            return {"ok": True, "scope": p["scope"]}
+
+    def remove_scope(self, pid: Any, entry: str) -> Dict[str, Any]:
+        with self._lock:
+            p = self._find(pid)
+            if p is None:
+                return {"ok": False, "error": "no such project"}
+            p["scope"] = [s for s in p.get("scope", []) if s != entry]
+            self._write()
+            return {"ok": True, "scope": p["scope"]}
+
+    def clear_scope(self, pid: Any) -> Dict[str, Any]:
+        with self._lock:
+            p = self._find(pid)
+            if p is None:
+                return {"ok": False, "error": "no such project"}
+            p["scope"] = []
+            self._write()
+            return {"ok": True, "scope": []}
 
 
 # ── Shell page ───────────────────────────────────────────────────────────────
@@ -430,6 +544,17 @@ _PAGE = r"""<!doctype html>
   .term-titlebar .dot.g { background:#28c840; }
   .term-title { margin-left:8px; color:#6b7787; font-size:11.5px; }
   #hunt-log.terminal { flex:1; min-height:0; overflow-y:auto; padding:10px 14px; color:#c9d4e5; }
+
+  /* ── Scope tab ── */
+  .scope-list { border:1px solid var(--border); border-radius:6px; min-height:60px; max-height:340px; overflow-y:auto; }
+  .scope-item { display:flex; align-items:center; gap:10px; padding:7px 12px; font-size:13px;
+    border-bottom:1px solid var(--border); }
+  .scope-item:last-child { border-bottom:none; }
+  .scope-item .host { flex:1; }
+  .scope-item button { font:inherit; font-size:12px; color:var(--muted); background:transparent;
+    border:0; cursor:pointer; padding:2px 6px; border-radius:4px; }
+  .scope-item button:hover { color:var(--red); background:var(--bg); }
+  .scope-empty { padding:14px 12px; color:var(--muted); font-size:12.5px; }
 </style>
 </head>
 <body>
@@ -443,6 +568,7 @@ _PAGE = r"""<!doctype html>
   <div class="workspace">
     <nav>
       <button data-tab="dashboard" class="active">Dashboard</button>
+      <button data-tab="scope">Scope</button>
       <button data-tab="auth">Auth</button>
       <button data-tab="ghost">Ghost</button>
     </nav>
@@ -484,6 +610,34 @@ _PAGE = r"""<!doctype html>
               <span class="term-title" id="h-term-title">beatrix@hunt</span>
             </div>
             <div id="hunt-log" class="terminal"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="pane-scope" class="pane">
+        <div class="pad">
+          <h2>Scope</h2>
+          <p class="sub">Paste URLs, domains, or IP addresses that are in scope for
+            <b id="scope-project">—</b>. Testing (Ghost's tools) and reported findings (Hunt) are
+            limited to these hosts and their subdomains. Leave empty to scan only the target itself.</p>
+          <div class="card" style="max-width:720px;">
+            <label style="display:block; font-size:12px; color:var(--muted); margin-bottom:6px;">Add to scope</label>
+            <textarea id="scope-input" rows="4"
+              placeholder="https://example.com&#10;api.example.com&#10;10.0.0.5"
+              style="width:100%; font:inherit; font-size:13px; color:var(--fg); background:var(--bg);
+                border:1px solid var(--border); border-radius:6px; padding:8px 10px; resize:vertical;"></textarea>
+            <div style="display:flex; gap:10px; align-items:center; margin-top:8px;">
+              <button id="scope-add" class="run">+ Add to scope</button>
+              <span id="scope-msg" style="color:var(--muted); font-size:12px;"></span>
+            </div>
+          </div>
+          <div style="max-width:720px; margin-top:18px;">
+            <div style="display:flex; align-items:center; margin-bottom:8px;">
+              <b style="font-size:13px;">In scope (<span id="scope-count">0</span>)</b>
+              <span class="spacer" style="flex:1;"></span>
+              <a id="scope-clear" style="color:var(--accent); font-size:12px; cursor:pointer;">clear all</a>
+            </div>
+            <div id="scope-list" class="scope-list"></div>
           </div>
         </div>
       </section>
@@ -873,6 +1027,57 @@ function saveHuntHtml() {
 }
 $("h-save").onclick = saveHuntHtml;
 
+// ── Scope: per-project list of in-scope hosts (Burp-style target scope) ──
+async function loadScopeFor(id) {
+  const ap = projects.find(p => p.id === id);
+  $("scope-project").textContent = ap ? ap.name : "—";
+  let entries = [];
+  try { entries = (await (await fetch("/scope?project=" + id)).json()).scope || []; } catch (e) {}
+  renderScopeList(entries);
+}
+function renderScopeList(entries) {
+  const wrap = $("scope-list");
+  $("scope-count").textContent = entries.length;
+  if (!entries.length) {
+    wrap.innerHTML = '<div class="scope-empty">No scope defined — Ghost and Hunt will scan only the target itself.</div>';
+    return;
+  }
+  wrap.innerHTML = "";
+  for (const host of entries) {
+    const row = document.createElement("div");
+    row.className = "scope-item";
+    const span = document.createElement("span");
+    span.className = "host"; span.textContent = host;
+    const btn = document.createElement("button");
+    btn.textContent = "✕ remove";
+    btn.onclick = () => removeScopeEntry(host);
+    row.appendChild(span); row.appendChild(btn);
+    wrap.appendChild(row);
+  }
+}
+async function addScopeEntries() {
+  const text = $("scope-input").value;
+  if (!text.trim()) { $("scope-msg").textContent = "Paste a URL, domain, or IP first."; return; }
+  try {
+    const r = await (await fetch("/scope/add", { method: "POST",
+      body: JSON.stringify({ project: activeProject, text }) })).json();
+    if (!r.ok) { $("scope-msg").textContent = "Error: " + (r.error || "could not add"); return; }
+    $("scope-input").value = ""; $("scope-msg").textContent = "";
+    renderScopeList(r.scope);
+  } catch (e) { $("scope-msg").textContent = "Error: " + e; }
+}
+async function removeScopeEntry(host) {
+  const r = await (await fetch("/scope/remove", { method: "POST",
+    body: JSON.stringify({ project: activeProject, entry: host }) })).json();
+  if (r.ok) renderScopeList(r.scope);
+}
+$("scope-add").onclick = addScopeEntries;
+$("scope-clear").onclick = async () => {
+  const r = await (await fetch("/scope/clear", { method: "POST",
+    body: JSON.stringify({ project: activeProject }) })).json();
+  if (r.ok) renderScopeList(r.scope);
+};
+
 // ── Projects: left rail (switch / create / delete) ──
 let projects = [], activeProject = null;
 function renderProjects() {
@@ -913,6 +1118,7 @@ function onProjectSwitch() {
   // so a run left going in another project stays visible when you switch back.
   loadGhostViewFor(activeProject);
   loadHuntViewFor(activeProject);
+  loadScopeFor(activeProject);
 }
 
 // Context menu
@@ -929,7 +1135,9 @@ $("ctx-del").onclick = () => {
 };
 
 loadHuntCatalog();
-loadProjects().then(() => { loadGhostViewFor(activeProject); loadHuntViewFor(activeProject); });  // restore any run in progress on load/refresh
+loadProjects().then(() => {
+  loadGhostViewFor(activeProject); loadHuntViewFor(activeProject); loadScopeFor(activeProject);
+});  // restore any run in progress + the active project's scope on load/refresh
 </script>
 </body>
 </html>"""
@@ -992,8 +1200,10 @@ class SuiteServer:
             return {"ok": False, "error": key_hint}
 
         objective = (objective or "").strip() or "Find and validate security vulnerabilities."
+        allowed_hosts = self.projects.get_scope(project_id)
         broker = _Broker(meta={"target": target, "model": cfg.model,
-                               "objective": objective, "auth": "none"})
+                               "objective": objective, "auth": "none",
+                               "scope": allowed_hosts})
         with self._lock:
             self.ghost_brokers[key] = broker
 
@@ -1002,6 +1212,7 @@ class SuiteServer:
             try:
                 result = asyncio.run(run_investigation(
                     target, cfg=cfg, objective=objective,
+                    allowed_hosts=allowed_hosts,
                     on_event=broker.emit, persist=True,
                 ))
                 broker.emit({"type": "verdict", "text": result.get("verdict", "done"),
@@ -1057,12 +1268,26 @@ class SuiteServer:
             if existing is not None and not existing.since(10**9)["done"]:
                 return {"ok": False, "error": "A scan is already running for this project."}
 
+        # Empty scope == unrestricted (same convention as everywhere else in
+        # the suite): scan/report on whatever the target and its crawl turn up.
+        scope_hosts = self.projects.get_scope(project_id)
+
         broker = _Broker(meta={"target": target, "preset": preset_label,
-                               "modules": modules, "ai": bool(ai)})
+                               "modules": modules, "ai": bool(ai), "scope": scope_hosts})
         with self._lock:
             self.hunt_brokers[key] = broker
 
         def _on_event(event: str, data: dict) -> None:
+            # Scope backstop #1: never even show an out-of-scope finding in
+            # the live terminal, regardless of whether the scanner that found
+            # it consulted the crawler's scope patterns.
+            if event == "finding" and scope_hosts:
+                f = data.get("finding")
+                url = (getattr(f, "url", "") if f else "") or target
+                if not _host_in_scope(url, scope_hosts):
+                    host = urlparse(url).hostname or url
+                    broker.emit({"type": "info", "text": f"⚠ Skipped out-of-scope finding on {host}"})
+                    return
             line = _hunt_event_to_line(event, data)
             if line is not None:
                 broker.emit(line)
@@ -1085,15 +1310,31 @@ class SuiteServer:
                 engine = BeatrixEngine(config=EngineConfig(), on_event=_on_event,
                                        output_manager=output_mgr)
 
+                crawler_scope = _expand_for_crawler(scope_hosts) if scope_hosts else None
+
                 async def _go():
                     # preset="full" always opens every phase (1-7), so an
                     # arbitrary, cross-category module selection can never be
                     # silently blocked by a narrower preset's phase gate — the
                     # explicit `modules` list is what actually restricts which
                     # scanners run (see kill_chain's per-scanner filter above).
-                    return await engine.hunt(target=target, preset="full", ai=ai, modules=modules)
+                    return await engine.hunt(target=target, preset="full", ai=ai,
+                                              modules=modules, scope=crawler_scope)
 
                 state = asyncio.run(_go())
+
+                # Scope backstop #2: the same filter as _on_event above, but
+                # against the final, deduplicated findings list — covers
+                # anything a scanner recorded through a path that bypassed the
+                # live per-event stream, before it's counted or persisted.
+                if scope_hosts:
+                    kept = [f for f in engine.findings
+                            if _host_in_scope((getattr(f, "url", "") or target), scope_hosts)]
+                    dropped = len(engine.findings) - len(kept)
+                    engine.findings = kept
+                    if dropped:
+                        broker.emit({"type": "info",
+                                     "text": f"⚠ {dropped} out-of-scope finding(s) excluded from the final report"})
 
                 duration = (datetime.now() - state.started_at).total_seconds()
                 modules_run = set()
@@ -1202,6 +1443,12 @@ class SuiteServer:
                     if proj is None:
                         proj = suite.projects.state().get("active")
                     self._json(suite.hunt_state(proj))
+                elif path == "/scope":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json({"scope": suite.projects.get_scope(proj)})
                 else:
                     self._send(404, b"not found", "text/plain")
 
@@ -1233,6 +1480,25 @@ class SuiteServer:
                     self._json(suite.start_hunt_run(
                         payload.get("target", ""), payload.get("modules") or [],
                         payload.get("preset", "custom"), bool(payload.get("ai")), proj))
+                elif path == "/scope/add":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    entries = _parse_scope_text(payload.get("text", ""))
+                    if not entries:
+                        self._json({"ok": False, "error": "no valid hosts/URLs found"})
+                    else:
+                        self._json(suite.projects.add_scope(proj, entries))
+                elif path == "/scope/remove":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.projects.remove_scope(proj, payload.get("entry", "")))
+                elif path == "/scope/clear":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.projects.clear_scope(proj))
                 elif path == "/projects/new":
                     self._json(suite.projects.new())
                 elif path == "/projects/select":

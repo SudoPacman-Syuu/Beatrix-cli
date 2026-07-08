@@ -131,8 +131,14 @@ async def http_request(
         headers: Extra headers as JSON (``{"X-Foo": "bar"}``) or ``Key: Value`` lines.
         body: Optional request body.
     """
+    session = ctx.context
+    if not session.scope.in_scope(url):
+        return (
+            f"Refusing to request '{url}': outside the authorized scope "
+            f"({', '.join(session.scope.allowed_hosts) or session.scope.host()})."
+        )
     try:
-        stored = await _send(ctx.context, method, url, _parse_headers(headers), body or None)
+        stored = await _send(session, method, url, _parse_headers(headers), body or None)
     except httpx.HTTPError as e:
         return _describe_http_error(url, e)
     header_summary = "; ".join(
@@ -168,6 +174,11 @@ async def inject(
         location: Where to inject — "query" (URL query string) or "body" (form body).
     """
     session = ctx.context
+    if not session.scope.in_scope(url):
+        return (
+            f"Refusing to inject into '{url}': outside the authorized scope "
+            f"({', '.join(session.scope.allowed_hosts) or session.scope.host()})."
+        )
     location = location.lower()
 
     method = "GET" if location == "query" else "POST"

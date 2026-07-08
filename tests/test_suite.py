@@ -367,3 +367,215 @@ def test_hunt_event_translator_covers_kill_chain_event_types():
     assert line["type"] == "finding" and "XSS" in line["text"]
     assert _hunt_event_to_line("info", {"message": "hi"})["type"] == "info"
     assert _hunt_event_to_line("unknown_event_type", {}) is None
+
+
+# ── Scope: parsing/matching helpers ──────────────────────────────────────
+def test_parse_scope_entry_normalizes_urls_and_bare_hosts():
+    from beatrix.cli.suite import _parse_scope_entry
+
+    assert _parse_scope_entry("https://Example.com/path?x=1") == "example.com"
+    assert _parse_scope_entry("example.com:8443") == "example.com"
+    assert _parse_scope_entry("  EXAMPLE.com  ") == "example.com"
+    assert _parse_scope_entry("*.example.com") == "*.example.com"
+    assert _parse_scope_entry("10.0.0.1") == "10.0.0.1"
+    assert _parse_scope_entry("   ") is None
+    assert _parse_scope_entry("") is None
+
+
+def test_is_ip_literal():
+    from beatrix.cli.suite import _is_ip_literal
+
+    assert _is_ip_literal("10.0.0.1") is True
+    assert _is_ip_literal("::1") is True
+    assert _is_ip_literal("example.com") is False
+
+
+def test_expand_for_crawler_adds_wildcards_except_ips_and_existing_wildcards():
+    from beatrix.cli.suite import _expand_for_crawler
+
+    assert _expand_for_crawler(["example.com"]) == ["example.com", "*.example.com"]
+    assert _expand_for_crawler(["*.example.com"]) == ["*.example.com"]
+    assert _expand_for_crawler(["10.0.0.1"]) == ["10.0.0.1"]
+
+
+def test_host_in_scope_matches_subdomains():
+    from beatrix.cli.suite import _host_in_scope
+
+    assert _host_in_scope("https://api.example.com/x", ["example.com"]) is True
+    assert _host_in_scope("https://example.com", ["example.com"]) is True
+    assert _host_in_scope("https://evil.com", ["example.com"]) is False
+
+
+def test_parse_scope_text_splits_dedups_and_drops_junk():
+    from beatrix.cli.suite import _parse_scope_text
+
+    raw = "https://example.com/x, api.example.com\n  ,, example.com   10.0.0.1"
+    assert _parse_scope_text(raw) == ["example.com", "api.example.com", "10.0.0.1"]
+
+
+# ── Scope: per-project storage (_ProjectStore) ───────────────────────────
+def test_project_store_scope_starts_empty(tmp_path):
+    store = _ProjectStore(tmp_path / "suite")
+    assert store.get_scope(1) == []
+
+
+def test_project_store_add_scope_merges_sorted_and_dedups(tmp_path):
+    store = _ProjectStore(tmp_path / "suite")
+    r = store.add_scope(1, ["b.com", "a.com"])
+    assert r == {"ok": True, "scope": ["a.com", "b.com"]}
+    r2 = store.add_scope(1, ["a.com", "c.com"])
+    assert r2["scope"] == ["a.com", "b.com", "c.com"]
+
+
+def test_project_store_remove_scope(tmp_path):
+    store = _ProjectStore(tmp_path / "suite")
+    store.add_scope(1, ["a.com", "b.com"])
+    r = store.remove_scope(1, "a.com")
+    assert r == {"ok": True, "scope": ["b.com"]}
+
+
+def test_project_store_clear_scope(tmp_path):
+    store = _ProjectStore(tmp_path / "suite")
+    store.add_scope(1, ["a.com", "b.com"])
+    r = store.clear_scope(1)
+    assert r == {"ok": True, "scope": []}
+
+
+def test_project_store_scope_isolated_per_project(tmp_path):
+    store = _ProjectStore(tmp_path / "suite")
+    store.new()  # project 2
+    store.add_scope(1, ["a.com"])
+    store.add_scope(2, ["b.com"])
+    assert store.get_scope(1) == ["a.com"]
+    assert store.get_scope(2) == ["b.com"]
+
+
+def test_project_store_scope_persists_across_restart(tmp_path):
+    sd = tmp_path / "suite"
+    store = _ProjectStore(sd)
+    store.add_scope(1, ["a.com"])
+    store2 = _ProjectStore(sd)
+    assert store2.get_scope(1) == ["a.com"]
+
+
+# ── Scope: HTTP routes ────────────────────────────────────────────────────
+def test_scope_get_empty_by_default(server):
+    code, body = _get(server, "/scope?project=1")
+    assert code == 200
+    assert json.loads(body) == {"scope": []}
+
+
+def test_scope_get_defaults_to_active_project(server):
+    _post(server, "/scope/add", {"project": 1, "text": "example.com"})
+    assert json.loads(_get(server, "/scope")[1]) == {"scope": ["example.com"]}
+
+
+def test_scope_add_route_parses_pasted_text(server):
+    code, r = _post(server, "/scope/add",
+                     {"project": 1, "text": "https://example.com/x, evil.com"})
+    assert code == 200
+    assert r == {"ok": True, "scope": ["evil.com", "example.com"]}
+
+
+def test_scope_add_route_rejects_unparseable_text(server):
+    code, r = _post(server, "/scope/add", {"project": 1, "text": "   "})
+    assert code == 200
+    assert r["ok"] is False
+    assert "no valid" in r["error"]
+
+
+def test_scope_remove_route(server):
+    _post(server, "/scope/add", {"project": 1, "text": "a.com b.com"})
+    code, r = _post(server, "/scope/remove", {"project": 1, "entry": "a.com"})
+    assert code == 200
+    assert r == {"ok": True, "scope": ["b.com"]}
+
+
+def test_scope_clear_route(server):
+    _post(server, "/scope/add", {"project": 1, "text": "a.com b.com"})
+    code, r = _post(server, "/scope/clear", {"project": 1})
+    assert code == 200
+    assert r == {"ok": True, "scope": []}
+
+
+def test_scope_isolated_between_projects_over_http(server):
+    _post(server, "/projects/new", {})  # project 2
+    _post(server, "/scope/add", {"project": 1, "text": "a.com"})
+    _post(server, "/scope/add", {"project": 2, "text": "b.com"})
+    assert json.loads(_get(server, "/scope?project=1")[1]) == {"scope": ["a.com"]}
+    assert json.loads(_get(server, "/scope?project=2")[1]) == {"scope": ["b.com"]}
+
+
+# ── Scope: enforcement wired into start_hunt_run / start_ghost_run ───────
+def test_start_ghost_run_passes_project_scope_as_allowed_hosts(server, monkeypatch):
+    # start_ghost_run does `from ...runner import run_investigation` and
+    # `from ...config import GhostV2Config` locally on every call, so patch
+    # the attributes on those modules directly (the local import resolves to
+    # whatever's on the module at call time).
+    import beatrix.ai.ghost2.config as config_mod
+    import beatrix.ai.ghost2.core.runner as runner_mod
+
+    captured = {}
+
+    async def fake_run_investigation(target, **kwargs):
+        captured["allowed_hosts"] = kwargs.get("allowed_hosts")
+        return {"verdict": "SECURE", "final_output": ""}
+
+    monkeypatch.setattr(runner_mod, "run_investigation", fake_run_investigation)
+    monkeypatch.setattr(config_mod.GhostV2Config, "missing_key_message", lambda self: None)
+    monkeypatch.setattr(config_mod.GhostV2Config, "load",
+                         staticmethod(lambda: config_mod.GhostV2Config(model="openrouter/x/y", api_key="k")))
+
+    server.projects.add_scope(1, ["example.com", "api.example.com"])
+    result = server.start_ghost_run("https://example.com", "find bugs", 1)
+    assert result["ok"] is True
+
+    import time
+    for _ in range(50):
+        if "allowed_hosts" in captured:
+            break
+        time.sleep(0.05)
+    assert captured["allowed_hosts"] == ["api.example.com", "example.com"]
+
+
+def test_start_hunt_run_filters_out_of_scope_findings(server, monkeypatch):
+    from datetime import datetime
+    from types import SimpleNamespace
+
+    from beatrix.core.types import Finding, Severity
+
+    async def fake_hunt(self, target, preset, ai, modules, scope=None):
+        in_scope_finding = Finding(
+            title="SQLi", url="https://example.com/x", severity=Severity.HIGH,
+            scanner_module="injection",
+        )
+        out_of_scope_finding = Finding(
+            title="XSS", url="https://evil.com/x", severity=Severity.HIGH,
+            scanner_module="injection",
+        )
+        self.findings = [in_scope_finding, out_of_scope_finding]
+        if self._on_event:
+            self._on_event("finding", {"finding": in_scope_finding})
+            self._on_event("finding", {"finding": out_of_scope_finding})
+        return SimpleNamespace(started_at=datetime.now(), phase_results={})
+
+    import beatrix.core.engine as engine_mod
+    monkeypatch.setattr(engine_mod.BeatrixEngine, "hunt", fake_hunt)
+
+    server.projects.add_scope(1, ["example.com"])
+    result = server.start_hunt_run("https://example.com", ["injection"], "custom", False, 1)
+    assert result["ok"] is True
+
+    import time
+    broker = server.hunt_brokers.get("1")
+    for _ in range(50):
+        if broker is not None and broker.since(10**9)["done"]:
+            break
+        time.sleep(0.05)
+
+    events = broker.since(0)["events"]
+    texts = " ".join(e.get("text", "") for e in events)
+    assert "Skipped out-of-scope finding" in texts
+    assert "excluded from the final report" in texts
+    finding_events = [e for e in events if e["type"] == "finding"]
+    assert len(finding_events) == 1  # the evil.com finding never became a terminal line

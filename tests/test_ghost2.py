@@ -659,3 +659,105 @@ def test_kb_load_skill_returns_tooling_content():
     w = kb.load_skill("nuclei")
     assert w is not None and "false positive" in w.text.lower()
     assert kb.load_skill("recon") is not None
+
+
+# ── Scope gating: http_request/inject/run_scanner refuse out-of-scope URLs ──
+# (Beatrix Suite's Scope tab; run_external_tool's equivalent gate predates
+# this and is exercised in test_spawn_agent_guards-adjacent external_tool
+# coverage — these three tools had NO scope check at all before.)
+def test_http_request_refuses_out_of_scope_url():
+    from beatrix.ai.ghost2.tools.http_tools import http_request
+
+    async def run():
+        s = GhostSession(Scope(target="https://example.com", allowed_hosts=["example.com"]))
+        r = await http_request.on_invoke_tool(_toolctx(s), '{"url":"https://evil.com/x"}')
+        assert "outside the authorized scope" in r
+        assert "example.com" in r
+
+    asyncio.run(run())
+
+
+def test_http_request_allows_in_scope_subdomain(monkeypatch):
+    from beatrix.ai.ghost2.tools import http_tools
+
+    async def fake_send(session, method, url, headers=None, body=None):
+        from beatrix.ai.ghost2.core.session import StoredResponse
+        return StoredResponse(id=1, status_code=200, headers={}, body="ok",
+                               response_time_ms=1, url=url, method=method)
+    monkeypatch.setattr(http_tools, "_send", fake_send)
+
+    async def run():
+        s = GhostSession(Scope(target="https://example.com", allowed_hosts=["example.com"]))
+        r = await http_tools.http_request.on_invoke_tool(
+            _toolctx(s), '{"url":"https://api.example.com/x"}')
+        assert "outside the authorized scope" not in r
+        assert "Response #1" in r
+
+    asyncio.run(run())
+
+
+def test_inject_refuses_out_of_scope_url():
+    from beatrix.ai.ghost2.tools.http_tools import inject
+
+    async def run():
+        s = GhostSession(Scope(target="https://example.com", allowed_hosts=["example.com"]))
+        r = await inject.on_invoke_tool(
+            _toolctx(s), '{"url":"https://evil.com/x","parameter":"id","payload":"1"}')
+        assert "outside the authorized scope" in r
+
+    asyncio.run(run())
+
+
+def test_run_scanner_refuses_out_of_scope_url():
+    from beatrix.ai.ghost2.tools.scanner_tool import run_scanner
+
+    async def run():
+        s = GhostSession(Scope(target="https://example.com", allowed_hosts=["example.com"]))
+        r = await run_scanner.on_invoke_tool(
+            _toolctx(s), '{"module":"headers","url":"https://evil.com/x"}')
+        assert "outside the authorized scope" in r
+
+    asyncio.run(run())
+
+
+def test_no_allowed_hosts_defaults_to_target_only():
+    # Default (no allowed_hosts) restricts to the target's own host — the
+    # same behavior as before this feature, so existing callers see no change.
+    from beatrix.ai.ghost2.tools.scanner_tool import run_scanner
+
+    async def run():
+        s = GhostSession(Scope(target="https://example.com"))  # allowed_hosts=[]
+        r = await run_scanner.on_invoke_tool(
+            _toolctx(s), '{"module":"headers","url":"https://other.com/x"}')
+        assert "outside the authorized scope" in r
+
+    asyncio.run(run())
+
+
+def test_run_investigation_threads_allowed_hosts_into_scope(monkeypatch):
+    # run_investigation() must build its Scope with the caller-supplied
+    # allowed_hosts instead of always defaulting to target-only.
+    import beatrix.ai.ghost2.core.runner as runner_mod
+
+    captured = {}
+    real_scope = runner_mod.Scope
+
+    def spy_scope(*a, **kw):
+        captured["allowed_hosts"] = kw.get("allowed_hosts")
+        return real_scope(*a, **kw)
+    monkeypatch.setattr(runner_mod, "Scope", spy_scope)
+
+    async def fake_run(agent, task, **kwargs):
+        return SimpleNamespace(final_output="done")
+    monkeypatch.setattr("agents.Runner.run", fake_run)
+
+    cfg = GhostV2Config(model="openrouter/x/y", api_key="k")
+
+    async def run():
+        await runner_mod.run_investigation(
+            "https://example.com", cfg=cfg,
+            allowed_hosts=["example.com", "api.example.com"], persist=False,
+        )
+
+    asyncio.run(run())
+    assert captured["allowed_hosts"] == ["example.com", "api.example.com"]
