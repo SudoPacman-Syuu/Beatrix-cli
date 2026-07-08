@@ -229,7 +229,15 @@ _PAGE = r"""<!doctype html>
   button.run { font:inherit; color:#08131a; background:var(--accent); border:0; border-radius:6px;
     padding:8px 16px; cursor:pointer; font-weight:600; }
   button.run:disabled { opacity:.5; cursor:default; }
-  #ghost-log { margin-top:14px; border-top:1px solid var(--border); padding-top:12px; }
+  .ghost-toolbar { display:flex; align-items:center; gap:16px; margin:10px 0 4px;
+    color:var(--muted); font-size:12px; }
+  .ghost-toolbar b { color:var(--fg); }
+  .ghost-toolbar .autoscroll-toggle { cursor:pointer; }
+  .ghost-toolbar .autoscroll-toggle:hover { color:var(--fg); }
+  .ghost-toolbar .btn { margin-left:auto; font:inherit; font-size:12px; color:var(--fg); background:var(--bg);
+    border:1px solid var(--border); border-radius:6px; padding:5px 11px; cursor:pointer; }
+  .ghost-toolbar .btn:hover { border-color:var(--accent); color:var(--accent); }
+  #ghost-log { margin-top:6px; border-top:1px solid var(--border); padding-top:12px; }
   .ev { padding:2px 0; white-space:pre-wrap; word-break:break-word; }
   .ev .ts { color:var(--muted); margin-right:8px; font-size:12px; }
   .ev .tag { font-weight:700; margin-right:8px; }
@@ -282,6 +290,13 @@ _PAGE = r"""<!doctype html>
             <button id="g-run" class="run">Run</button>
           </div>
           <div id="g-msg" style="color:var(--muted); font-size:12px;"></div>
+          <div class="ghost-toolbar">
+            <span>events <b id="g-count">0</b></span>
+            <span>tools <b id="g-tools">0</b></span>
+            <span>elapsed <b id="g-elapsed">0s</b></span>
+            <span id="g-autoscroll" class="autoscroll-toggle" title="click to toggle">⤓ autoscroll: on</span>
+            <button id="g-save" class="btn" title="Save this run as a standalone HTML file">💾 Save HTML</button>
+          </div>
           <div id="ghost-log"></div>
         </div>
       </section>
@@ -316,6 +331,10 @@ document.querySelectorAll("nav button").forEach(btn => {
 // left going in another project can never leak into (or get cut off by
 // switching away from) the one currently on screen.
 let since = 0, pollProject = null;
+// `autoscroll` is a UI preference, not run data — it's intentionally NOT reset
+// on project switch, matching the standalone GHOST v2 dashboard.
+let ghostTools = 0, autoscroll = true, ghostStarted = null;
+
 function renderEvent(ev) {
   const d = document.createElement("div");
   d.className = "ev " + ev.type;
@@ -324,6 +343,7 @@ function renderEvent(ev) {
   if (ev.detail) html += `<span class="detail">${esc(ev.detail)}</span>`;
   d.innerHTML = html;
   $("ghost-log").appendChild(d);
+  if (ev.type === "tool_start") { ghostTools++; $("g-tools").textContent = ghostTools; }
 }
 async function poll(id) {
   if (id !== pollProject) return;               // a different project is on screen now
@@ -333,7 +353,9 @@ async function poll(id) {
   } catch (e) { setTimeout(() => poll(id), 600); return; }
   if (id !== pollProject) return;                // switched away while this fetch was in flight
   for (const ev of r.events) { renderEvent(ev); since = ev.seq; }
-  $("ghost-log").scrollTop = $("ghost-log").scrollHeight;
+  $("g-count").textContent = since;
+  if (autoscroll) $("ghost-log").scrollTop = $("ghost-log").scrollHeight;
+  if (ghostStarted) $("g-elapsed").textContent = Math.round(Date.now()/1000 - ghostStarted) + "s";
   if (r.done) { $("g-run").disabled = false; $("g-msg").textContent = "Run finished."; return; }
   $("g-run").disabled = true;
   setTimeout(() => poll(id), 600);
@@ -343,7 +365,8 @@ async function poll(id) {
 // point is this survives having been switched away from) and resume polling
 // if it's still running.
 async function loadGhostViewFor(id) {
-  $("ghost-log").innerHTML = ""; since = 0;
+  $("ghost-log").innerHTML = ""; since = 0; ghostTools = 0; ghostStarted = null;
+  $("g-count").textContent = "0"; $("g-tools").textContent = "0"; $("g-elapsed").textContent = "0s";
   pollProject = id;
   $("g-run").disabled = false; $("g-msg").textContent = "";
   let st = {};
@@ -352,6 +375,7 @@ async function loadGhostViewFor(id) {
   if (st && st.target) {
     $("g-target").value = st.target;
     $("g-obj").value = st.objective || "";
+    ghostStarted = st.started || null;
     $("g-msg").textContent = st.running ? "Running: " + st.target : "Run finished.";
     poll(id);                                     // replays history; keeps going if still running
   } else {
@@ -362,7 +386,9 @@ $("g-run").onclick = async () => {
   const target = $("g-target").value.trim();
   if (!target) { $("g-msg").textContent = "Enter a target first."; return; }
   $("g-run").disabled = true; $("g-msg").textContent = "Starting…";
-  $("ghost-log").innerHTML = ""; since = 0; pollProject = activeProject;
+  $("ghost-log").innerHTML = ""; since = 0; ghostTools = 0; ghostStarted = Date.now() / 1000;
+  $("g-count").textContent = "0"; $("g-tools").textContent = "0"; $("g-elapsed").textContent = "0s";
+  pollProject = activeProject;
   try {
     const r = await (await fetch("/ghost/run", { method:"POST",
       body: JSON.stringify({ target, objective: $("g-obj").value.trim(), project: activeProject }) })).json();
@@ -371,6 +397,63 @@ $("g-run").onclick = async () => {
     poll(activeProject);
   } catch (e) { $("g-msg").textContent = "Error: " + e; $("g-run").disabled = false; }
 };
+
+$("g-autoscroll").onclick = () => {
+  autoscroll = !autoscroll;
+  $("g-autoscroll").textContent = "⤓ autoscroll: " + (autoscroll ? "on" : "off");
+};
+
+// Save the CURRENT project's ghost log as a standalone, self-contained HTML
+// file for the record — same feature as the standalone GHOST v2 dashboard,
+// scoped to just this run's content (not the whole Suite shell/other panes).
+function saveGhostHtml() {
+  const proj = projects.find(p => p.id === activeProject);
+  const projName = proj ? proj.name : ("Project " + activeProject);
+  const target = $("g-target").value || "—";
+  const objective = $("g-obj").value || "—";
+  const statusText = $("g-msg").textContent || "";
+  const logHtml = $("ghost-log").innerHTML;
+  const html = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>GHOST v2 — ${esc(projName)} — ${esc(target)}</title>
+<style>
+  :root { --bg:#0b0e14; --panel:#11151f; --border:#222a38; --fg:#c9d4e5; --muted:#6b7787;
+    --accent:#3fd0d6; --red:#ff6b6b; --green:#5fd479; --yellow:#e5c07b; --violet:#b98cff; --blue:#5aa9ff; }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f7f9fc; --panel:#fff; --border:#dce3ec; --fg:#1f2733; --muted:#6b7787;
+      --accent:#0b8a90; --red:#c0392b; --green:#1a7f37; --yellow:#8a6d1a; --violet:#7a3ff2; --blue:#0969da; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+    font:14px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; padding:20px 24px 60px; }
+  h1 { font-size:16px; margin:0 0 6px; }
+  .meta { color:var(--muted); font-size:12px; margin-bottom:2px; }
+  .ev { padding:2px 0; white-space:pre-wrap; word-break:break-word; }
+  .ev .ts { color:var(--muted); margin-right:8px; font-size:12px; }
+  .ev .tag { font-weight:700; margin-right:8px; }
+  .ev.tool_start .tag { color:var(--yellow); } .ev.tool_end .tag { color:var(--blue); }
+  .ev.agent_start .tag { color:var(--accent); } .ev.agent_end .tag { color:var(--muted); }
+  .ev.reasoning .tag, .ev.thinking .tag { color:var(--violet); }
+  .ev.finding .tag { color:var(--red); } .ev.verdict .tag { color:var(--green); }
+  .ev .detail { display:block; color:var(--muted); margin:2px 0 2px 84px; padding:6px 9px;
+    background:var(--panel); border:1px solid var(--border); border-radius:6px; max-height:220px; overflow:auto; }
+</style></head><body>
+<h1>👻 GHOST v2 — ${esc(projName)}</h1>
+<div class="meta">target <b>${esc(target)}</b> · objective <b>${esc(objective)}</b></div>
+<div class="meta">${esc(statusText)} · saved ${new Date().toLocaleString()}</div>
+<div style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px;">${logHtml}</div>
+</body></html>`;
+  const blob = new Blob([html], { type: "text/html" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const safeProj = projName.replace(/[^a-z0-9.\-]+/gi, "_");
+  const safeTarget = target.replace(/[^a-z0-9.\-]+/gi, "_");
+  const ts = new Date().toISOString().replace(/[:]/g, "-").replace("T", "_").slice(0, 19);
+  a.href = url;
+  a.download = "ghost2-" + safeProj + "-" + safeTarget + "-" + ts + ".html";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+$("g-save").onclick = saveGhostHtml;
 
 // ── Projects: left rail (switch / create / delete) ──
 let projects = [], activeProject = null;

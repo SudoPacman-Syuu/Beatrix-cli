@@ -53,6 +53,16 @@ def test_shell_served_at_root(server):
         assert tab in text
 
 
+def test_ghost_pane_has_original_dashboard_controls(server):
+    # Regression: the Ghost pane must carry the same controls the standalone
+    # GHOST v2 dashboard has — autoscroll toggle, Save HTML, and the
+    # events/tools/elapsed stat readout — not just the bare log.
+    text = _get(server, "/")[1].decode()
+    for needle in ('id="g-autoscroll"', 'id="g-save"', 'id="g-count"',
+                   'id="g-tools"', 'id="g-elapsed"', "saveGhostHtml"):
+        assert needle in text, f"missing {needle!r} from Ghost pane"
+
+
 def test_auth_gui_mounted_same_origin(server):
     # The Auth tab iframes /auth on the SAME origin — full reuse of the existing page.
     code, body = _get(server, "/auth")
