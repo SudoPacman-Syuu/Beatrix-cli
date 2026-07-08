@@ -2,10 +2,11 @@
 Tests for the Beatrix Suite central dashboard (`beatrix-suite`).
 
 The suite unifies the existing GUIs behind ONE stdlib http.server: the shell at
-/, the auth GUI mounted verbatim at /auth (+ its /api/* backend), and a Ghost
-tool that streams a run's events at /ghost/events. These tests exercise the
-route wiring and the ghost event plumbing over real HTTP without a browser,
-LLM, or API key.
+/, the auth GUI mounted verbatim at /auth (+ its /api/* backend), a Ghost tool
+that streams a run's events at /ghost/events, and a Hunt tool (the Dashboard's
+module/preset control panel + terminal) that streams at /hunt/events. These
+tests exercise the route wiring and event plumbing over real HTTP without a
+browser, LLM, API key, or a real scan.
 """
 
 from __future__ import annotations
@@ -248,3 +249,121 @@ def test_project_workspace_dir_created_and_removed(tmp_path):
     assert (tmp_path / "suite" / "projects" / "2").is_dir()
     store.delete(2)
     assert not (tmp_path / "suite" / "projects" / "2").exists()
+
+
+# ── Hunt tool: catalog, validation, per-project run isolation ────────────
+def test_hunt_catalog_shape(server):
+    code, body = _get(server, "/hunt/catalog")
+    assert code == 200
+    cat = json.loads(body)
+    assert len(cat["modules"]) >= 30  # BeatrixEngine's real module count
+    assert {"key", "name", "category", "description"} <= set(cat["modules"][0])
+    preset_keys = {p["key"] for p in cat["presets"]}
+    assert {"quick", "standard", "full", "stealth"} <= preset_keys
+
+
+def test_hunt_catalog_full_preset_is_every_module(server):
+    cat = json.loads(_get(server, "/hunt/catalog")[1])
+    full = next(p for p in cat["presets"] if p["key"] == "full")
+    assert set(full["modules"]) == {m["key"] for m in cat["modules"]}
+
+
+def test_hunt_catalog_modules_grouped_by_category(server):
+    # Regression: modules used to be sorted by key, not category, so same-
+    # category modules weren't adjacent and the panel printed a near-duplicate
+    # header per module instead of grouping them.
+    cat = json.loads(_get(server, "/hunt/catalog")[1])
+    cats_in_order = [m["category"] for m in cat["modules"]]
+    # Every occurrence of a category must be contiguous (no A, B, A pattern).
+    seen = set()
+    prev = None
+    for c in cats_in_order:
+        if c != prev:
+            assert c not in seen, f"category {c!r} appeared in two separate groups"
+            seen.add(c)
+        prev = c
+
+
+def test_hunt_run_rejects_empty_target(server):
+    code, result = _post(server, "/hunt/run", {"target": "  ", "modules": ["headers"], "project": 1})
+    assert code == 200
+    assert result["ok"] is False and "target" in result["error"].lower()
+
+
+def test_hunt_run_rejects_empty_module_selection(server):
+    # Empty modules must NOT silently mean "run everything" (that's what an
+    # empty list means to BeatrixEngine.hunt/kill_chain) — it must be rejected.
+    code, result = _post(server, "/hunt/run", {"target": "example.com", "modules": [], "project": 1})
+    assert result["ok"] is False
+    assert "module" in result["error"].lower()
+
+
+def test_hunt_events_empty_before_any_run(server):
+    code, body = _get(server, "/hunt/events?since=0&project=1")
+    assert code == 200
+    assert json.loads(body) == {"events": [], "done": True}
+
+
+def test_hunt_events_stream_from_broker(server):
+    b = _Broker(meta={"target": "https://x", "modules": ["headers"]})
+    server.hunt_brokers["1"] = b
+    b.emit({"type": "scanner_start", "text": "▸ headers → https://x"})
+    b.emit({"type": "finding", "text": "[LOW] Missing CSP", "detail": "URL: https://x"})
+
+    data = json.loads(_get(server, "/hunt/events?since=0&project=1")[1])
+    assert [e["type"] for e in data["events"]] == ["scanner_start", "finding"]
+    assert data["done"] is False
+
+    b.finish()
+    assert json.loads(_get(server, "/hunt/events?since=0&project=1")[1])["done"] is True
+
+
+def test_hunt_state_reflects_current_run(server):
+    assert json.loads(_get(server, "/hunt/state?project=1")[1]) == {}
+    server.hunt_brokers["1"] = _Broker(meta={"target": "https://x", "modules": ["headers"]})
+    state = json.loads(_get(server, "/hunt/state?project=1")[1])
+    assert state["target"] == "https://x" and state["running"] is True
+
+
+def test_hunt_run_isolated_between_projects(server):
+    b1 = _Broker(meta={"target": "https://one.com"})
+    server.hunt_brokers["1"] = b1
+    b1.emit({"type": "scanner_start", "text": "▸ headers"})
+
+    _post(server, "/projects/new", {})  # project 2, never ran anything
+    assert json.loads(_get(server, "/hunt/state?project=2")[1]) == {}
+
+    state1 = json.loads(_get(server, "/hunt/state?project=1")[1])
+    assert state1["target"] == "https://one.com" and state1["running"] is True
+
+
+def test_hunt_run_rejects_concurrent_run_on_same_project(server):
+    server.hunt_brokers["1"] = _Broker(meta={"target": "https://x"})  # still running
+    code, result = _post(server, "/hunt/run",
+                          {"target": "https://y", "modules": ["headers"], "project": 1})
+    assert result["ok"] is False
+    assert "already running" in result["error"].lower()
+
+
+def test_hunt_event_translator_covers_kill_chain_event_types():
+    # The translator must produce a sensible line for every event type
+    # kill_chain.py actually emits (scanner_start/done/error, phase_*, crawl_*,
+    # finding, info) so nothing silently vanishes from the terminal.
+    from types import SimpleNamespace
+
+    from beatrix.cli.suite import _hunt_event_to_line
+
+    assert _hunt_event_to_line("phase_start", {"phase": "Recon", "description": "d"})["type"] == "phase"
+    assert _hunt_event_to_line("phase_done", {"phase": "Recon", "findings": 2, "duration": 1.0})["type"] == "phase_done"
+    assert _hunt_event_to_line("crawl_start", {})["type"] == "info"
+    assert _hunt_event_to_line("crawl_done", {"pages": 1})["type"] == "info"
+    assert _hunt_event_to_line("crawl_error", {"error": "x"})["type"] == "scanner_error"
+    assert _hunt_event_to_line("scanner_start", {"scanner": "cors"})["type"] == "scanner_start"
+    assert _hunt_event_to_line("scanner_done", {"scanner": "cors", "findings": 0}) is None  # quiet on zero
+    assert _hunt_event_to_line("scanner_done", {"scanner": "cors", "findings": 1})["type"] == "scanner_done"
+    assert _hunt_event_to_line("scanner_error", {"scanner": "cors", "error": "boom"})["type"] == "scanner_error"
+    finding = SimpleNamespace(title="XSS", url="https://x", parameter="q", severity=None, evidence="ev")
+    line = _hunt_event_to_line("finding", {"finding": finding})
+    assert line["type"] == "finding" and "XSS" in line["text"]
+    assert _hunt_event_to_line("info", {"message": "hi"})["type"] == "info"
+    assert _hunt_event_to_line("unknown_event_type", {}) is None

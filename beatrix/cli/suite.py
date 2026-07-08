@@ -66,6 +66,136 @@ _AUTH_POST = {
 }
 
 
+# ── Hunt module/preset catalog ───────────────────────────────────────────────
+# Plain-language descriptions for the control panel's hover tooltips. Reuses
+# the CLI's own MODULE_REFERENCE (same table `beatrix arsenal` prints) so
+# descriptions never drift; a few modules that exist on BeatrixEngine but
+# predate/postdate that table get a short fallback description here instead.
+_MODULE_FALLBACK_DESC = {
+    "param_miner": {
+        "name": "Param Miner", "category": "Reconnaissance",
+        "description": "Finds hidden, unlinked request parameters by diffing responses "
+                        "against a large wordlist — surfaces debug flags, cache keys, "
+                        "and undocumented API parameters.",
+    },
+    "sequencer": {
+        "name": "Token Sequencer", "category": "A07: Authentication Failures",
+        "description": "Statistically analyzes session tokens, password-reset codes, and "
+                        "CSRF tokens for low entropy or predictable patterns.",
+    },
+    "backslash": {
+        "name": "Backslash-Powered Scanner", "category": "A03: Injection",
+        "description": "Probes how each parameter's input is actually processed before "
+                        "attacking it — cuts false positives versus blindly spraying payloads.",
+    },
+    "dom_xss": {
+        "name": "DOM XSS Scanner", "category": "A03: Injection",
+        "description": "Drives a real browser (Playwright) to find client-side / "
+                        "DOM-based XSS that a payload sent straight to the server would never trigger.",
+    },
+}
+
+_catalog_cache: Dict[str, Any] = {}
+
+
+def _build_hunt_catalog() -> Dict[str, Any]:
+    """Build the module + preset catalog once, from the real engine.
+
+    Modules are restricted to whatever ``BeatrixEngine`` actually loaded, so
+    the panel can never offer a module that doesn't exist or isn't installed
+    (e.g. ``dom_xss`` when Playwright is missing), and each is enriched with
+    the plain-language description used for the control panel's hover tooltips.
+    """
+    if _catalog_cache:
+        return _catalog_cache
+
+    from beatrix.cli.main import MODULE_REFERENCE
+    from beatrix.core.engine import BeatrixEngine
+
+    engine = BeatrixEngine()
+    modules = []
+    for key in sorted(engine.modules):
+        info = MODULE_REFERENCE.get(key) or _MODULE_FALLBACK_DESC.get(key) or {
+            "name": key.replace("_", " ").title(), "category": "Other",
+            "description": "No description available yet.",
+        }
+        modules.append({"key": key, "name": info["name"],
+                        "category": info["category"], "description": info["description"]})
+    # Sort by category (then name) so same-category modules are adjacent —
+    # the control panel groups consecutive same-category entries under one
+    # header, so alphabetical-by-key order would print a near-duplicate
+    # header per module instead of grouping them.
+    modules.sort(key=lambda m: (m["category"], m["name"]))
+
+    presets = []
+    for key, cfg in BeatrixEngine.PRESETS.items():
+        preset_modules = cfg["modules"] or sorted(engine.modules)  # [] means "all modules"
+        presets.append({
+            "key": key, "name": cfg["name"], "description": cfg["description"],
+            "modules": [m for m in preset_modules if m in engine.modules],
+        })
+
+    _catalog_cache["modules"] = modules
+    _catalog_cache["presets"] = presets
+    return _catalog_cache
+
+
+def _hunt_event_to_line(event: str, data: dict) -> Optional[Dict[str, str]]:
+    """Convert one kill-chain progress event into a terminal line for the Hunt
+    broker. Mirrors the CLI hunt command's own event renderer (``main.py``'s
+    ``_on_event``) so the browser terminal reads like the real CLI output —
+    just without Rich markup, since the frontend colors lines by ``type``
+    instead (same pattern as the Ghost pane's event tags).
+    """
+    if event == "phase_start":
+        return {"type": "phase",
+                "text": f"{data.get('icon', '🔧')} {data.get('phase', '')} — {data.get('description', '')}"}
+    if event == "phase_done":
+        dur = data.get("duration", 0)
+        n = data.get("findings", 0)
+        return {"type": "phase_done",
+                "text": f"✓ {data.get('phase', '')} complete — {n} finding{'s' if n != 1 else ''} ({dur:.1f}s)"}
+    if event == "crawl_start":
+        return {"type": "info", "text": "🕷 Crawling target..."}
+    if event == "crawl_done":
+        return {"type": "info", "text": (
+            f"🕷 Crawl complete — {data.get('pages', 0)} pages, {data.get('urls', 0)} URLs, "
+            f"{data.get('params_urls', 0)} with params, {data.get('js_files', 0)} JS files"
+        )}
+    if event == "crawl_error":
+        return {"type": "scanner_error", "text": f"✗ Crawl error: {data.get('error', '')}"}
+    if event == "scanner_start":
+        return {"type": "scanner_start", "text": f"▸ {data.get('scanner', '')} → {data.get('target', '')}"}
+    if event == "scanner_done":
+        # Quiet on zero-finding completions (33 modules × "done, 0 findings"
+        # would drown the transcript) — matches the CLI's own verbosity choice.
+        n = data.get("findings", 0)
+        if n > 0:
+            return {"type": "scanner_done",
+                    "text": f"⚡ {data.get('scanner', '')} found {n} issue{'s' if n != 1 else ''}"}
+        return None
+    if event == "scanner_error":
+        return {"type": "scanner_error", "text": f"✗ {data.get('scanner', '')}: {data.get('error', '')}"}
+    if event == "finding":
+        f = data.get("finding")
+        if not f:
+            return None
+        sev = getattr(getattr(f, "severity", None), "value", "info")
+        title = getattr(f, "title", "Finding")
+        parts = []
+        if getattr(f, "url", None):
+            parts.append(f"URL: {f.url}")
+        if getattr(f, "parameter", None):
+            parts.append(f"Param: {f.parameter}")
+        evidence = getattr(f, "evidence", None)
+        if evidence:
+            parts.append(f"Evidence: {str(evidence)[:500]}")
+        return {"type": "finding", "text": f"[{sev.upper()}] {title}", "detail": "\n".join(parts)}
+    if event == "info":
+        return {"type": "info", "text": f"ℹ {data.get('message', '')}"}
+    return None
+
+
 # ── Projects ─────────────────────────────────────────────────────────────────
 class _ProjectStore:
     """Persistent list of projects (workspaces) the dashboard switches between.
@@ -107,6 +237,14 @@ class _ProjectStore:
 
     def _proj_dir(self, pid: int) -> Path:
         return self.root / "projects" / str(pid)
+
+    def workspace_dir(self, pid: Any) -> Path:
+        """Public accessor: the on-disk directory a project's scan output
+        lives under, so tools (e.g. Hunt) can root their output there and
+        keep projects' data separated."""
+        d = self._proj_dir(pid)
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     def _create_locked(self) -> Dict[str, Any]:
         """Append a new project + make it active. Caller holds the lock."""
@@ -211,6 +349,9 @@ _PAGE = r"""<!doctype html>
   .pane.active { display:block; }
   .pane.frame { overflow:hidden; }
   iframe { width:100%; height:100%; border:0; display:block; }
+  /* The Hunt workstation is a control panel + terminal side by side, so it
+     overrides the generic block layout while active (ID beats .pane.active). */
+  #pane-dashboard.active { display:flex; flex-direction:row; overflow:hidden; }
 
   /* Right-click context menu for project tabs */
   .ctx { position:fixed; z-index:50; display:none; background:var(--panel); border:1px solid var(--border);
@@ -245,9 +386,50 @@ _PAGE = r"""<!doctype html>
   .ev.agent_start .tag { color:var(--accent); } .ev.agent_end .tag { color:var(--muted); }
   .ev.reasoning .tag, .ev.thinking .tag { color:var(--violet); }
   .ev.finding .tag { color:var(--red); } .ev.verdict .tag { color:var(--green); }
+  .ev.phase .tag { color:var(--accent); } .ev.phase_done .tag { color:var(--green); }
+  .ev.scanner_start .tag { color:var(--yellow); } .ev.scanner_done .tag { color:var(--blue); }
+  .ev.scanner_error .tag { color:var(--red); } .ev.info .tag { color:var(--muted); }
   .ev .detail { display:block; color:var(--muted); margin:2px 0 2px 84px; padding:6px 9px;
     background:var(--panel); border:1px solid var(--border); border-radius:6px; max-height:220px; overflow:auto; }
   .card { border:1px solid var(--border); border-radius:8px; background:var(--panel); padding:16px 18px; max-width:640px; }
+
+  /* ── Hunt workstation: control panel (left) + terminal (right) ── */
+  .hunt-controls { width:340px; flex-shrink:0; overflow-y:auto; border-right:1px solid var(--border);
+    padding:16px; display:flex; flex-direction:column; min-height:0; }
+  .hunt-controls label { display:block; font-size:12px; color:var(--muted); margin:12px 0 4px; }
+  .hunt-controls label:first-of-type { margin-top:0; }
+  .hunt-controls input[type=text] { width:100%; }
+  .presets { display:flex; flex-wrap:wrap; gap:6px; }
+  .preset-chip { font:inherit; font-size:11px; color:var(--muted); background:var(--bg);
+    border:1px solid var(--border); border-radius:12px; padding:4px 10px; cursor:pointer; }
+  .preset-chip:hover { border-color:var(--accent); color:var(--fg); }
+  .preset-chip.active { background:var(--accent); color:#08131a; border-color:var(--accent); font-weight:600; }
+  .mod-actions { display:flex; align-items:center; gap:10px; font-size:11px; color:var(--muted); margin:12px 0 6px; }
+  .mod-actions a { color:var(--accent); text-decoration:none; cursor:pointer; }
+  .mod-actions a:hover { text-decoration:underline; }
+  .mod-actions .spacer { flex:1; }
+  .modules { flex:1; min-height:80px; overflow-y:auto; border:1px solid var(--border); border-radius:6px; padding:4px 6px; }
+  .mod-cat { font-size:10px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted);
+    font-weight:700; padding:8px 4px 3px; }
+  .mod-cat:first-child { padding-top:4px; }
+  .mod-row { display:flex; align-items:center; gap:8px; padding:4px 6px; border-radius:4px; cursor:pointer; font-size:12.5px; }
+  .mod-row:hover { background:var(--bg); }
+  .mod-row input { flex-shrink:0; margin:0; }
+  .mod-tooltip { position:fixed; z-index:60; display:none; max-width:280px; background:var(--panel);
+    border:1px solid var(--border); border-radius:6px; padding:8px 10px; font-size:12px; color:var(--fg);
+    line-height:1.45; box-shadow:0 8px 24px rgba(0,0,0,.35); pointer-events:none; }
+
+  .hunt-terminal-wrap { flex:1; min-width:0; display:flex; flex-direction:column; padding:16px; min-height:0; }
+  .term-chrome { flex:1; min-height:0; display:flex; flex-direction:column; background:#050607;
+    border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+  .term-titlebar { display:flex; align-items:center; gap:6px; padding:8px 10px; background:#0d0f14;
+    border-bottom:1px solid #1a1e28; flex-shrink:0; }
+  .term-titlebar .dot { width:10px; height:10px; border-radius:50%; }
+  .term-titlebar .dot.r { background:#ff5f57; }
+  .term-titlebar .dot.y { background:#febc2e; }
+  .term-titlebar .dot.g { background:#28c840; }
+  .term-title { margin-left:8px; color:#6b7787; font-size:11.5px; }
+  #hunt-log.terminal { flex:1; min-height:0; overflow-y:auto; padding:10px 14px; color:#c9d4e5; }
 </style>
 </head>
 <body>
@@ -266,14 +448,42 @@ _PAGE = r"""<!doctype html>
     </nav>
     <main>
       <section id="pane-dashboard" class="pane active">
-        <div class="pad">
-          <h2>Beatrix Suite</h2>
-          <p class="sub">Active project: <b id="dash-project">—</b> · pick a tool from the tabs above.</p>
-          <div class="card">
-            <b>Projects</b>
-            <p style="margin:6px 0 0; color:var(--muted);">Use the left rail to switch workspaces.
-              <b>+</b> creates a project; right-click a project to delete it. Each project keeps its
-              own scan data and scope separate.</p>
+        <aside class="hunt-controls">
+          <h2 style="margin-top:0;">New Scan</h2>
+          <p class="sub" style="margin:0 0 12px;">Project: <b id="dash-project">—</b></p>
+
+          <label>Target</label>
+          <input id="h-target" type="text" placeholder="https://example.com or example.com">
+
+          <label>Presets <span style="font-weight:400; color:var(--muted);">(quick-select)</span></label>
+          <div class="presets" id="h-presets"></div>
+
+          <div class="mod-actions">
+            <span id="h-selcount">0 selected</span>
+            <span class="spacer"></span>
+            <a id="h-selall">select all</a>
+            <a id="h-selnone">clear</a>
+          </div>
+          <div class="modules" id="h-modules"></div>
+
+          <button id="h-run" class="run" style="width:100%; margin-top:14px;">▶ Begin Scan</button>
+          <div id="h-msg" style="color:var(--muted); font-size:12px; margin-top:8px;"></div>
+        </aside>
+
+        <div class="hunt-terminal-wrap">
+          <div class="ghost-toolbar" style="margin-top:0;">
+            <span>events <b id="h-count">0</b></span>
+            <span>findings <b id="h-findings">0</b></span>
+            <span>elapsed <b id="h-elapsed">0s</b></span>
+            <span id="h-autoscroll" class="autoscroll-toggle" title="click to toggle">⤓ autoscroll: on</span>
+            <button id="h-save" class="btn" title="Save this run as a standalone HTML file">💾 Save HTML</button>
+          </div>
+          <div class="term-chrome">
+            <div class="term-titlebar">
+              <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+              <span class="term-title" id="h-term-title">beatrix@hunt</span>
+            </div>
+            <div id="hunt-log" class="terminal"></div>
           </div>
         </div>
       </section>
@@ -304,6 +514,7 @@ _PAGE = r"""<!doctype html>
   </div>
 </div>
 <div id="ctxmenu" class="ctx"><button id="ctx-del">Delete project</button></div>
+<div id="mod-tooltip" class="mod-tooltip"></div>
 <script>
 const TAGS = { thinking:"🧠 thinking", system_prompt:"📋 system", prompt:"📤 prompt",
   reasoning:"💭 reasoning", tool_start:"🔧 tool", tool_end:"↳ result", agent_start:"▶ agent",
@@ -455,6 +666,213 @@ function saveGhostHtml() {
 }
 $("g-save").onclick = saveGhostHtml;
 
+// ── Hunt: the Dashboard workstation — module/preset control panel + terminal.
+// Structurally mirrors the Ghost pane above (own per-project broker on the
+// server, same rebuild-not-wipe project-switch pattern, same toolbar), kept
+// as its own separate set of functions rather than sharing code with Ghost's,
+// since Ghost's per-project streaming took real care to get right and this
+// avoids risking a regression there for the sake of DRY-ing working code.
+const HUNT_TAGS = { phase:"▶ phase", phase_done:"✓ phase", scanner_start:"▸ scanner",
+  scanner_done:"⚡ result", scanner_error:"✗ error", finding:"⚑ finding",
+  verdict:"✔ verdict", info:"ℹ info" };
+let hSince = 0, hPollProject = null, hFindings = 0, hAutoscroll = true, hStarted = null;
+let hCatalog = { modules: [], presets: [] };
+let hSelected = new Set();
+
+function renderHuntEvent(ev) {
+  const d = document.createElement("div");
+  d.className = "ev " + ev.type;
+  const tag = HUNT_TAGS[ev.type] || ev.type;
+  let html = `<span class="ts">${new Date(ev.ts*1000).toLocaleTimeString()}</span><span class="tag">${tag}</span>${esc(ev.text||"")}`;
+  if (ev.detail) html += `<span class="detail">${esc(ev.detail)}</span>`;
+  d.innerHTML = html;
+  $("hunt-log").appendChild(d);
+  if (ev.type === "finding") { hFindings++; $("h-findings").textContent = hFindings; }
+}
+async function hPoll(id) {
+  if (id !== hPollProject) return;
+  let r;
+  try { r = await (await fetch("/hunt/events?since=" + hSince + "&project=" + id)).json(); }
+  catch (e) { setTimeout(() => hPoll(id), 600); return; }
+  if (id !== hPollProject) return;
+  for (const ev of r.events) { renderHuntEvent(ev); hSince = ev.seq; }
+  $("h-count").textContent = hSince;
+  if (hAutoscroll) $("hunt-log").scrollTop = $("hunt-log").scrollHeight;
+  if (hStarted) $("h-elapsed").textContent = Math.round(Date.now()/1000 - hStarted) + "s";
+  if (r.done) { $("h-run").disabled = false; $("h-msg").textContent = "Run finished."; return; }
+  $("h-run").disabled = true;
+  setTimeout(() => hPoll(id), 600);
+}
+async function loadHuntViewFor(id) {
+  $("hunt-log").innerHTML = ""; hSince = 0; hFindings = 0; hStarted = null;
+  $("h-count").textContent = "0"; $("h-findings").textContent = "0"; $("h-elapsed").textContent = "0s";
+  hPollProject = id;
+  $("h-run").disabled = false; $("h-msg").textContent = "";
+  let st = {};
+  try { st = await (await fetch("/hunt/state?project=" + id)).json(); } catch (e) {}
+  if (id !== hPollProject) return;
+  const ap = projects.find(p => p.id === id);
+  $("h-term-title").textContent = "beatrix@hunt — " + (ap ? ap.name : "project " + id);
+  if (st && st.target) {
+    hStarted = st.started || null;
+    $("h-msg").textContent = st.running ? "Running: " + st.target : "Run finished.";
+    hPoll(id);
+  }
+}
+
+// ── Module/preset control panel ──
+function showModTooltip(x, y, text) {
+  const t = $("mod-tooltip");
+  t.textContent = text;
+  t.style.left = (x + 14) + "px"; t.style.top = (y + 14) + "px";
+  t.style.display = "block";
+}
+function hideModTooltip() { $("mod-tooltip").style.display = "none"; }
+
+function renderModules() {
+  const wrap = $("h-modules"); wrap.innerHTML = "";
+  let lastCat = null;
+  for (const m of hCatalog.modules) {
+    if (m.category !== lastCat) {
+      const h = document.createElement("div");
+      h.className = "mod-cat"; h.textContent = m.category;
+      wrap.appendChild(h); lastCat = m.category;
+    }
+    const row = document.createElement("label");
+    row.className = "mod-row"; row.dataset.desc = m.description;
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.dataset.key = m.key; cb.checked = hSelected.has(m.key);
+    cb.onchange = () => {
+      if (cb.checked) hSelected.add(m.key); else hSelected.delete(m.key);
+      updateSelCount(); syncPresetHighlight();
+    };
+    row.appendChild(cb);
+    row.appendChild(document.createTextNode(" " + m.name));
+    wrap.appendChild(row);
+  }
+  // Hover tooltip via delegation — one listener instead of one per row.
+  wrap.onmouseover = (e) => {
+    const row = e.target.closest(".mod-row");
+    if (row) showModTooltip(e.clientX, e.clientY, row.dataset.desc);
+  };
+  wrap.onmousemove = (e) => {
+    const row = e.target.closest(".mod-row");
+    if (row) showModTooltip(e.clientX, e.clientY, row.dataset.desc);
+  };
+  wrap.onmouseout = (e) => { if (!e.relatedTarget || !e.relatedTarget.closest(".mod-row")) hideModTooltip(); };
+}
+function updateSelCount() {
+  $("h-selcount").textContent = hSelected.size + " selected";
+}
+function syncPresetHighlight() {
+  // A preset chip lights up only when the current selection exactly matches it.
+  for (const chip of document.querySelectorAll(".preset-chip")) {
+    const preset = hCatalog.presets.find(p => p.key === chip.dataset.key);
+    const matches = preset && preset.modules.length === hSelected.size
+      && preset.modules.every(k => hSelected.has(k));
+    chip.classList.toggle("active", !!matches);
+  }
+}
+function applySelection(keys) {
+  hSelected = new Set(keys);
+  for (const cb of document.querySelectorAll("#h-modules input[type=checkbox]")) {
+    cb.checked = hSelected.has(cb.dataset.key);
+  }
+  updateSelCount(); syncPresetHighlight();
+}
+function renderPresets() {
+  const wrap = $("h-presets"); wrap.innerHTML = "";
+  for (const p of hCatalog.presets) {
+    const chip = document.createElement("button");
+    chip.type = "button"; chip.className = "preset-chip"; chip.dataset.key = p.key;
+    chip.textContent = p.name; chip.title = p.description;
+    chip.onclick = () => applySelection(p.modules);
+    wrap.appendChild(chip);
+  }
+}
+async function loadHuntCatalog() {
+  hCatalog = await (await fetch("/hunt/catalog")).json();
+  renderPresets(); renderModules();
+  const standard = hCatalog.presets.find(p => p.key === "standard");
+  applySelection(standard ? standard.modules : []);  // sensible one-click default
+}
+$("h-selall").onclick = (e) => { e.preventDefault(); applySelection(hCatalog.modules.map(m => m.key)); };
+$("h-selnone").onclick = (e) => { e.preventDefault(); applySelection([]); };
+
+$("h-autoscroll").onclick = () => {
+  hAutoscroll = !hAutoscroll;
+  $("h-autoscroll").textContent = "⤓ autoscroll: " + (hAutoscroll ? "on" : "off");
+};
+
+$("h-run").onclick = async () => {
+  const target = $("h-target").value.trim();
+  if (!target) { $("h-msg").textContent = "Enter a target first."; return; }
+  if (hSelected.size === 0) { $("h-msg").textContent = "Select at least one module."; return; }
+  $("h-run").disabled = true; $("h-msg").textContent = "Starting…";
+  $("hunt-log").innerHTML = ""; hSince = 0; hFindings = 0; hStarted = Date.now() / 1000;
+  $("h-count").textContent = "0"; $("h-findings").textContent = "0"; $("h-elapsed").textContent = "0s";
+  hPollProject = activeProject;
+  const matchedPreset = hCatalog.presets.find(p =>
+    p.modules.length === hSelected.size && p.modules.every(k => hSelected.has(k)));
+  try {
+    const r = await (await fetch("/hunt/run", { method:"POST", body: JSON.stringify({
+      target, modules: Array.from(hSelected), preset: matchedPreset ? matchedPreset.key : "custom",
+      project: activeProject,
+    }) })).json();
+    if (!r.ok) { $("h-msg").textContent = "Error: " + (r.error || "could not start"); $("h-run").disabled = false; return; }
+    $("h-msg").textContent = "Running: " + target;
+    hPoll(activeProject);
+  } catch (e) { $("h-msg").textContent = "Error: " + e; $("h-run").disabled = false; }
+};
+
+function saveHuntHtml() {
+  const proj = projects.find(p => p.id === activeProject);
+  const projName = proj ? proj.name : ("Project " + activeProject);
+  const target = $("h-target").value || "—";
+  const statusText = $("h-msg").textContent || "";
+  const logHtml = $("hunt-log").innerHTML;
+  const html = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Hunt — ${esc(projName)} — ${esc(target)}</title>
+<style>
+  :root { --bg:#0b0e14; --panel:#11151f; --border:#222a38; --fg:#c9d4e5; --muted:#6b7787;
+    --accent:#3fd0d6; --red:#ff6b6b; --green:#5fd479; --yellow:#e5c07b; --violet:#b98cff; --blue:#5aa9ff; }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f7f9fc; --panel:#fff; --border:#dce3ec; --fg:#1f2733; --muted:#6b7787;
+      --accent:#0b8a90; --red:#c0392b; --green:#1a7f37; --yellow:#8a6d1a; --violet:#7a3ff2; --blue:#0969da; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:#050607; color:var(--fg);
+    font:14px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; padding:20px 24px 60px; }
+  h1 { font-size:16px; margin:0 0 6px; }
+  .meta { color:var(--muted); font-size:12px; margin-bottom:2px; }
+  .ev { padding:2px 0; white-space:pre-wrap; word-break:break-word; }
+  .ev .ts { color:var(--muted); margin-right:8px; font-size:12px; }
+  .ev .tag { font-weight:700; margin-right:8px; }
+  .ev.phase .tag { color:var(--accent); } .ev.phase_done .tag { color:var(--green); }
+  .ev.scanner_start .tag { color:var(--yellow); } .ev.scanner_done .tag { color:var(--blue); }
+  .ev.scanner_error .tag { color:var(--red); } .ev.info .tag { color:var(--muted); }
+  .ev.finding .tag { color:var(--red); } .ev.verdict .tag { color:var(--green); }
+  .ev .detail { display:block; color:var(--muted); margin:2px 0 2px 84px; padding:6px 9px;
+    background:var(--panel); border:1px solid var(--border); border-radius:6px; max-height:220px; overflow:auto; }
+</style></head><body>
+<h1>⚔️ BEATRIX HUNT — ${esc(projName)}</h1>
+<div class="meta">target <b>${esc(target)}</b></div>
+<div class="meta">${esc(statusText)} · saved ${new Date().toLocaleString()}</div>
+<div style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px;">${logHtml}</div>
+</body></html>`;
+  const blob = new Blob([html], { type: "text/html" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const safeProj = projName.replace(/[^a-z0-9.\-]+/gi, "_");
+  const safeTarget = target.replace(/[^a-z0-9.\-]+/gi, "_");
+  const ts = new Date().toISOString().replace(/[:]/g, "-").replace("T", "_").slice(0, 19);
+  a.href = url;
+  a.download = "hunt-" + safeProj + "-" + safeTarget + "-" + ts + ".html";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+$("h-save").onclick = saveHuntHtml;
+
 // ── Projects: left rail (switch / create / delete) ──
 let projects = [], activeProject = null;
 function renderProjects() {
@@ -494,6 +912,7 @@ function onProjectSwitch() {
   // Rebuild (never just clear) the per-project tool views from server state,
   // so a run left going in another project stays visible when you switch back.
   loadGhostViewFor(activeProject);
+  loadHuntViewFor(activeProject);
 }
 
 // Context menu
@@ -509,7 +928,8 @@ $("ctx-del").onclick = () => {
   deleteProject(id);
 };
 
-loadProjects().then(() => loadGhostViewFor(activeProject));  // restore any run in progress on load/refresh
+loadHuntCatalog();
+loadProjects().then(() => { loadGhostViewFor(activeProject); loadHuntViewFor(activeProject); });  // restore any run in progress on load/refresh
 </script>
 </body>
 </html>"""
@@ -529,6 +949,8 @@ class SuiteServer:
         # One ghost run + event broker PER project (keyed by str(project id)), so
         # switching projects preserves each project's live run view.
         self.ghost_brokers: Dict[str, _Broker] = {}
+        # Same per-project isolation for Hunt (the deterministic scanner pipeline).
+        self.hunt_brokers: Dict[str, _Broker] = {}
         self._lock = threading.Lock()
 
     # ── Ghost run lifecycle ──────────────────────────────────────────────
@@ -607,6 +1029,117 @@ class SuiteServer:
         state["running"] = not b.since(10**9)["done"]
         return state
 
+    # ── Hunt run lifecycle ───────────────────────────────────────────────
+    def start_hunt_run(self, target: str, modules: List[str], preset_label: str,
+                        ai: bool, project_id: Any) -> Dict[str, Any]:
+        """Launch a deterministic Hunt scan in a background thread, scoped to
+        ``project_id`` exactly like Ghost — its own broker, its own
+        concurrent-run guard, and its scan output rooted in the project's own
+        workspace dir so projects' scan data stays separated.
+
+        ``modules`` must be a non-empty explicit list: ``BeatrixEngine.hunt()``
+        treats an *empty* list as "run every module" (see kill_chain's
+        module-filter: ``if requested_modules and name not in requested_modules:
+        skip`` — empty is falsy, so nothing gets filtered out). Silently running
+        the entire arsenal on a selection the user meant to leave blank would
+        be a nasty surprise, so this is rejected instead.
+        """
+        target = (target or "").strip()
+        if not target:
+            return {"ok": False, "error": "target required"}
+        modules = [m for m in (modules or []) if m]
+        if not modules:
+            return {"ok": False, "error": "select at least one module"}
+
+        key = str(project_id)
+        with self._lock:
+            existing = self.hunt_brokers.get(key)
+            if existing is not None and not existing.since(10**9)["done"]:
+                return {"ok": False, "error": "A scan is already running for this project."}
+
+        broker = _Broker(meta={"target": target, "preset": preset_label,
+                               "modules": modules, "ai": bool(ai)})
+        with self._lock:
+            self.hunt_brokers[key] = broker
+
+        def _on_event(event: str, data: dict) -> None:
+            line = _hunt_event_to_line(event, data)
+            if line is not None:
+                broker.emit(line)
+
+        def _run() -> None:
+            import asyncio
+            from datetime import datetime
+
+            from beatrix.core.engine import BeatrixEngine, EngineConfig
+            from beatrix.core.scan_output import ScanOutputManager
+
+            try:
+                output_mgr = None
+                try:
+                    output_mgr = ScanOutputManager(
+                        target, base_dir=self.projects.workspace_dir(project_id))
+                except Exception:
+                    pass
+
+                engine = BeatrixEngine(config=EngineConfig(), on_event=_on_event,
+                                       output_manager=output_mgr)
+
+                async def _go():
+                    # preset="full" always opens every phase (1-7), so an
+                    # arbitrary, cross-category module selection can never be
+                    # silently blocked by a narrower preset's phase gate — the
+                    # explicit `modules` list is what actually restricts which
+                    # scanners run (see kill_chain's per-scanner filter above).
+                    return await engine.hunt(target=target, preset="full", ai=ai, modules=modules)
+
+                state = asyncio.run(_go())
+
+                duration = (datetime.now() - state.started_at).total_seconds()
+                modules_run = set()
+                for pr in state.phase_results.values():
+                    modules_run.update(pr.modules_run)
+
+                hunt_id = None
+                try:
+                    from beatrix.core.findings_db import FindingsDB
+                    with FindingsDB() as db:
+                        hunt_id = db.save_hunt(
+                            target=target, preset=preset_label, findings=engine.findings,
+                            duration=duration, modules_run=sorted(modules_run),
+                            ai_enabled=ai, started_at=state.started_at,
+                        )
+                except Exception:
+                    pass
+
+                n = len(engine.findings)
+                detail = f"{duration:.1f}s · modules: {', '.join(sorted(modules_run)) or 'none'}"
+                if hunt_id:
+                    detail += f" · hunt #{hunt_id}"
+                broker.emit({"type": "verdict",
+                             "text": f"Hunt complete — {n} finding{'s' if n != 1 else ''}",
+                             "detail": detail})
+            except Exception as e:  # noqa: BLE001 — surface any failure to the pane
+                broker.emit({"type": "verdict", "text": "error",
+                             "detail": f"{type(e).__name__}: {e}"})
+            finally:
+                broker.finish()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return {"ok": True, "target": target}
+
+    def hunt_events(self, since: int, project_id: Any) -> Dict[str, Any]:
+        b = self.hunt_brokers.get(str(project_id))
+        return b.since(since) if b is not None else {"events": [], "done": True}
+
+    def hunt_state(self, project_id: Any) -> Dict[str, Any]:
+        b = self.hunt_brokers.get(str(project_id))
+        if b is None:
+            return {}
+        state = dict(b.meta)
+        state["running"] = not b.since(10**9)["done"]
+        return state
+
     # ── HTTP ─────────────────────────────────────────────────────────────
     def start(self, open_browser: bool = True) -> str:
         suite = self
@@ -654,6 +1187,21 @@ class SuiteServer:
                     if proj is None:
                         proj = suite.projects.state().get("active")
                     self._json(suite.ghost_state(proj))
+                elif path == "/hunt/catalog":
+                    self._json(_build_hunt_catalog())
+                elif path == "/hunt/events":
+                    q = parse_qs(urlparse(self.path).query)
+                    since = int((q.get("since") or ["0"])[0])
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.hunt_events(since, proj))
+                elif path == "/hunt/state":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.hunt_state(proj))
                 else:
                     self._send(404, b"not found", "text/plain")
 
@@ -678,6 +1226,13 @@ class SuiteServer:
                         proj = suite.projects.state().get("active")
                     self._json(suite.start_ghost_run(
                         payload.get("target", ""), payload.get("objective", ""), proj))
+                elif path == "/hunt/run":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.start_hunt_run(
+                        payload.get("target", ""), payload.get("modules") or [],
+                        payload.get("preset", "custom"), bool(payload.get("ai")), proj))
                 elif path == "/projects/new":
                     self._json(suite.projects.new())
                 elif path == "/projects/select":
