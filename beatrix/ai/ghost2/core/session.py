@@ -79,6 +79,12 @@ class GhostSession:
     def __init__(self, scope: Scope, callback: Optional[Any] = None, runtime: Optional[Any] = None):
         self.scope = scope
         self.callback = callback  # optional GhostCallback-style UI bridge
+        # Optional live sink invoked with the full Finding object each time one
+        # is newly recorded (root agent or any subagent). The Suite dashboard
+        # uses this to stream findings into its Issues tab as they're found;
+        # unlike ``callback.on_finding`` (title+severity only) it gets the whole
+        # object, so no detail is lost. Best-effort — never breaks a run.
+        self.on_finding: Optional[Any] = None
         # Execution backend for shell/python/external tools (host or Docker).
         # Attached by the runner; may be None in unit tests that never exec.
         self.runtime = runtime
@@ -168,6 +174,11 @@ class GhostSession:
             self._finding_keys.add(key)
             self.findings.append(finding)
         self._emit("finding", finding.title, finding.severity.value)
+        if self.on_finding is not None:
+            try:
+                self.on_finding(finding)
+            except Exception:
+                pass
         return True
 
     # ── Scratch state ───────────────────────────────────────────────────

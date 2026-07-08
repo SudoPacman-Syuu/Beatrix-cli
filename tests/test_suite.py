@@ -17,7 +17,7 @@ import urllib.request
 import pytest
 
 from beatrix.cli.ghost_web import _Broker
-from beatrix.cli.suite import _AUTH_GET, _AUTH_POST, _ProjectStore, SuiteServer
+from beatrix.cli.suite import _AUTH_GET, _AUTH_POST, _IssueStore, _ProjectStore, SuiteServer
 
 
 @pytest.fixture
@@ -688,3 +688,203 @@ def test_stop_route_defaults_to_active_project(server, monkeypatch):
 
     code, r = _post(server, "/ghost/stop", {})  # no project -> active project (1)
     assert code == 200 and r["ok"] is True
+
+
+# ── Issues: per-project store (serialization, dedup, edit, delete) ───────
+def _finding(**kw):
+    from beatrix.core.types import Confidence, Finding, Severity
+    defaults = dict(title="SQLi in id", severity=Severity.HIGH, confidence=Confidence.FIRM,
+                    url="https://example.com/search?id=1", parameter="id", payload="1'",
+                    description="classic sqli", impact="db read", remediation="parameterize",
+                    evidence={"error": "SQL syntax"}, cwe_id="CWE-89",
+                    references=["https://owasp.org/sqli"], scanner_module="injection",
+                    request="GET /search?id=1", response="SQL error", poc_curl="curl ...",
+                    reproduction_steps=["step1", "step2"], validated=True)
+    defaults.update(kw)
+    return Finding(**defaults)
+
+
+def test_issue_serialization_full_detail(tmp_path):
+    store = _IssueStore(_ProjectStore(tmp_path / "suite"))
+    summary = store.add_finding(1, _finding(), "injection", "hunt")
+    assert summary["id"] == 1 and summary["severity"] == "high" and summary["host"] == "example.com"
+    d = store.get(1, 1)
+    assert d["path"] == "/search" and d["parameter"] == "id" and d["module"] == "injection"
+    assert d["cwe"] == "CWE-89" and d["origin"] == "hunt" and d["validated"] is True
+    # references include the finding's own + a derived CWE docs link
+    assert "https://owasp.org/sqli" in d["references"]
+    assert "https://cwe.mitre.org/data/definitions/89.html" in d["references"]
+    # dict evidence is stringified
+    assert "SQL syntax" in d["evidence"]
+    assert d["reproduction_steps"] == ["step1", "step2"]
+
+
+def test_issue_dedup_is_idempotent(tmp_path):
+    store = _IssueStore(_ProjectStore(tmp_path / "suite"))
+    assert store.add_finding(1, _finding(), "injection", "hunt") is not None
+    assert store.add_finding(1, _finding(), "injection", "hunt") is None  # same key -> no dup
+    assert store.count(1) == 1
+    # a different URL is a distinct issue
+    assert store.add_finding(1, _finding(url="https://example.com/x?id=2"), "injection", "hunt") is not None
+    assert store.count(1) == 2
+
+
+def test_issue_update_severity_and_highlight(tmp_path):
+    store = _IssueStore(_ProjectStore(tmp_path / "suite"))
+    store.add_finding(1, _finding(), "injection", "hunt")
+    assert store.update(1, 1, severity="critical")["issue"]["severity"] == "critical"
+    assert store.update(1, 1, highlight="red")["issue"]["highlight"] == "red"
+    assert store.update(1, 1, highlight="none")["issue"]["highlight"] is None
+    assert store.update(1, 1, severity="bogus")["ok"] is False
+    assert store.update(1, 1, highlight="chartreuse")["ok"] is False
+    assert store.update(1, 999, severity="low")["ok"] is False
+
+
+def test_issue_edit_survives_completion_sweep(tmp_path):
+    # A user re-triages an issue; a later re-add of the same finding (the Ghost
+    # completion sweep, or a scanner re-emit) must NOT reset their severity.
+    store = _IssueStore(_ProjectStore(tmp_path / "suite"))
+    store.add_finding(1, _finding(), "injection", "hunt")
+    store.update(1, 1, severity="low")
+    assert store.add_finding(1, _finding(), "injection", "hunt") is None
+    assert store.get(1, 1)["severity"] == "low"
+
+
+def test_issue_delete_and_clear(tmp_path):
+    store = _IssueStore(_ProjectStore(tmp_path / "suite"))
+    store.add_finding(1, _finding(), "injection", "hunt")
+    store.add_finding(1, _finding(url="https://example.com/x?id=2"), "injection", "hunt")
+    assert store.delete(1, 1)["ok"] is True
+    assert store.delete(1, 1)["ok"] is False
+    assert store.count(1) == 1
+    store.clear(1)
+    assert store.count(1) == 0
+
+
+def test_issues_isolated_and_persisted_per_project(tmp_path):
+    ps = _ProjectStore(tmp_path / "suite")
+    ps.new()  # project 2
+    store = _IssueStore(ps)
+    store.add_finding(1, _finding(), "injection", "hunt")
+    store.add_finding(2, _finding(url="https://example.com/x?id=2"), "injection", "hunt")
+    assert store.count(1) == 1 and store.count(2) == 1
+    # a fresh store over the same dir sees the persisted issues
+    store2 = _IssueStore(ps)
+    assert store2.count(1) == 1 and store2.get(1, 1)["title"] == "SQLi in id"
+
+
+# ── Issues: HTTP routes ──────────────────────────────────────────────────
+def test_issues_routes_empty_by_default(server):
+    assert json.loads(_get(server, "/issues?project=1")[1]) == {"issues": []}
+    assert json.loads(_get(server, "/issues/count?project=1")[1]) == {"count": 0}
+    assert json.loads(_get(server, "/issues/detail?project=1&id=1")[1]) == {"issue": None}
+
+
+def test_issues_routes_full_lifecycle(server):
+    server.issues.add_finding(1, _finding(), "injection", "hunt")
+    lst = json.loads(_get(server, "/issues?project=1")[1])["issues"]
+    assert len(lst) == 1 and lst[0]["title"] == "SQLi in id"
+    assert json.loads(_get(server, "/issues/count?project=1")[1])["count"] == 1
+    detail = json.loads(_get(server, "/issues/detail?project=1&id=1")[1])["issue"]
+    assert detail["remediation"] == "parameterize"
+
+    up = _post(server, "/issues/update", {"project": 1, "id": 1, "severity": "critical", "highlight": "blue"})[1]
+    assert up["ok"] is True and up["issue"]["severity"] == "critical" and up["issue"]["highlight"] == "blue"
+
+    assert _post(server, "/issues/delete", {"project": 1, "id": 1})[1]["ok"] is True
+    assert json.loads(_get(server, "/issues/count?project=1")[1])["count"] == 0
+
+
+def test_issues_route_defaults_to_active_project(server):
+    server.issues.add_finding(1, _finding(), "injection", "hunt")
+    assert json.loads(_get(server, "/issues")[1])["issues"][0]["id"] == 1
+
+
+def test_issues_clear_route(server):
+    server.issues.add_finding(1, _finding(), "injection", "hunt")
+    server.issues.add_finding(1, _finding(url="https://example.com/x?id=2"), "injection", "hunt")
+    assert _post(server, "/issues/clear", {"project": 1})[1]["ok"] is True
+    assert json.loads(_get(server, "/issues/count?project=1")[1])["count"] == 0
+
+
+# ── Issues: live capture from Hunt + Ghost runs ──────────────────────────
+def test_hunt_run_captures_findings_as_issues(server, monkeypatch):
+    from datetime import datetime
+    from types import SimpleNamespace
+
+    from beatrix.core.types import Finding, Severity
+
+    async def fake_hunt(self, target, preset, ai, modules, scope=None):
+        f = Finding(title="Missing CSP", url="https://example.com/", severity=Severity.LOW,
+                    scanner_module="headers")
+        self.findings = [f]
+        if self._on_event:
+            self._on_event("finding", {"finding": f, "scanner": "headers"})
+        return SimpleNamespace(started_at=datetime.now(), phase_results={})
+
+    import beatrix.core.engine as engine_mod
+    monkeypatch.setattr(engine_mod.BeatrixEngine, "hunt", fake_hunt)
+
+    server.start_hunt_run("https://example.com", ["headers"], "custom", False, 1)
+    import time
+    for _ in range(60):
+        if server.issues.count(1) >= 1:
+            break
+        time.sleep(0.05)
+    issues = server.issues.list(1)
+    assert len(issues) == 1
+    assert issues[0]["title"] == "Missing CSP" and issues[0]["origin"] == "hunt"
+    assert issues[0]["module"] == "headers"
+
+
+def test_ghost_run_captures_findings_as_issues(server, monkeypatch):
+    import beatrix.ai.ghost2.config as config_mod
+    import beatrix.ai.ghost2.core.runner as runner_mod
+    from beatrix.core.types import Finding, Severity
+
+    captured_finding = Finding(title="SSRF in url param", url="https://example.com/fetch?url=x",
+                               severity=Severity.HIGH, scanner_module="ghost2", parameter="url")
+
+    async def fake_run_investigation(target, **kwargs):
+        # exercise the live sink exactly like session.add_finding would
+        cb = kwargs.get("on_finding")
+        if cb:
+            cb(captured_finding)
+        return {"verdict": "VULNERABLE", "final_output": "", "findings": [captured_finding]}
+
+    monkeypatch.setattr(runner_mod, "run_investigation", fake_run_investigation)
+    monkeypatch.setattr(config_mod.GhostV2Config, "missing_key_message", lambda self: None)
+    monkeypatch.setattr(config_mod.GhostV2Config, "load",
+                        staticmethod(lambda: config_mod.GhostV2Config(model="openrouter/x/y", api_key="k")))
+
+    assert server.start_ghost_run("https://example.com", "find bugs", 1)["ok"] is True
+    import time
+    for _ in range(60):
+        if server.issues.count(1) >= 1:
+            break
+        time.sleep(0.05)
+    # live sink + completion sweep must NOT double-count (dedup)
+    issues = server.issues.list(1)
+    assert len(issues) == 1
+    assert issues[0]["title"] == "SSRF in url param" and issues[0]["origin"] == "ghost"
+
+
+def test_ghost_session_on_finding_sink_fires():
+    # The mechanism the Suite relies on: add_finding invokes session.on_finding
+    # with the full Finding object (root + subagents share the session).
+    import asyncio
+
+    from beatrix.ai.ghost2.core.session import GhostSession, Scope
+    from beatrix.core.types import Finding, Severity
+
+    seen = []
+
+    async def run():
+        s = GhostSession(Scope(target="https://example.com"))
+        s.on_finding = lambda f: seen.append(f)
+        await s.add_finding(Finding(title="x", url="https://example.com", severity=Severity.LOW))
+        # duplicate (same title+url) shouldn't fire the sink again
+        await s.add_finding(Finding(title="x", url="https://example.com", severity=Severity.LOW))
+
+    asyncio.run(run())
+    assert len(seen) == 1 and seen[0].title == "x"

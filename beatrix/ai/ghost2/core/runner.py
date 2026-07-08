@@ -28,6 +28,7 @@ async def run_investigation(
     verbose: bool = False,
     persist: bool = True,
     on_event: Optional[Any] = None,
+    on_finding: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Run a full GHOST v2 investigation against ``target``.
 
@@ -81,6 +82,8 @@ async def run_investigation(
     # Run-scoped services the graph tools and OOB tools read off the session.
     session.cfg = cfg
     session.hooks = hooks
+    # Live finding sink (Suite Issues tab): fires per newly-recorded finding.
+    session.on_finding = on_finding
     session.pocserver = await _start_pocserver()
     # A scan directory (matching `beatrix hunt`) so raw tool output and the
     # final findings land in the standard layout every reporter reads.

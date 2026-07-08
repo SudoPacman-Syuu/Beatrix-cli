@@ -433,6 +433,209 @@ class _ProjectStore:
             return {"ok": True, "scope": []}
 
 
+# ── Issues (Burp-style) ──────────────────────────────────────────────────────
+# Every scanner "result"/finding — from a deterministic Hunt scan or a GHOST
+# agent run — becomes a persistent, per-project *issue* the user can inspect,
+# re-triage (severity), highlight, and delete, exactly like Burp's Issue
+# activity. Severity has a fixed rank so the list can sort by it meaningfully.
+_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+_VALID_SEVERITIES = set(_SEVERITY_ORDER)
+# The palette offered in the right-click "Highlight" menu (Burp-style).
+_HIGHLIGHT_COLORS = {"red", "orange", "yellow", "green", "blue", "purple", "gray", "none"}
+
+
+def _stringify_evidence(ev: Any) -> str:
+    """A Finding's ``evidence`` may be a str, dict, list, or anything — render
+    it to a stable string for display without exploding on odd types."""
+    if ev is None:
+        return ""
+    if isinstance(ev, str):
+        return ev
+    try:
+        return json.dumps(ev, indent=2, default=str)
+    except Exception:
+        return str(ev)
+
+
+def _doc_links(finding: Any) -> List[str]:
+    """Derive documentation links (Burp's "References"/classifications) from a
+    finding's own references plus its CWE id, so every issue links out to real
+    docs even when the scanner didn't supply a URL."""
+    links: List[str] = []
+    for r in (getattr(finding, "references", None) or []):
+        if r and r not in links:
+            links.append(str(r))
+    cwe = getattr(finding, "cwe_id", None)
+    if cwe is not None:
+        m = re.search(r"\d+", str(cwe))
+        if m:
+            url = f"https://cwe.mitre.org/data/definitions/{m.group()}.html"
+            if url not in links:
+                links.append(url)
+    return links
+
+
+def _finding_to_issue(finding: Any, scanner: str, origin: str) -> Dict[str, Any]:
+    """Serialize a ``beatrix.core.types.Finding`` into a plain-dict issue record
+    (the on-disk + wire format). Tolerates partially-populated findings from any
+    of the 33 scanners or the agent's ``record_finding``."""
+    url = getattr(finding, "url", "") or ""
+    parsed = urlparse(url)
+    sev = getattr(getattr(finding, "severity", None), "value", None) or "info"
+    conf = getattr(getattr(finding, "confidence", None), "value", None) or "tentative"
+    module = (getattr(finding, "scanner_module", "") or scanner or "unknown")
+    title = getattr(finding, "title", "") or "Untitled finding"
+    return {
+        "title": title,
+        "severity": sev,
+        "orig_severity": sev,
+        "confidence": conf,
+        "url": url,
+        "host": parsed.netloc,
+        "path": parsed.path or "/",
+        "parameter": getattr(finding, "parameter", None) or "",
+        "module": module,
+        "origin": origin,
+        "payload": getattr(finding, "payload", None) or "",
+        "description": getattr(finding, "description", "") or "",
+        "impact": getattr(finding, "impact", "") or "",
+        "remediation": getattr(finding, "remediation", "") or "",
+        "evidence": _stringify_evidence(getattr(finding, "evidence", None)),
+        "request": getattr(finding, "request", None) or "",
+        "response": getattr(finding, "response", None) or "",
+        "references": _doc_links(finding),
+        "cwe": ("" if getattr(finding, "cwe_id", None) is None else str(finding.cwe_id)),
+        "owasp": getattr(finding, "owasp_category", None) or "",
+        "poc_curl": getattr(finding, "poc_curl", None) or "",
+        "poc_python": getattr(finding, "poc_python", None) or "",
+        "reproduction_steps": list(getattr(finding, "reproduction_steps", None) or []),
+        "validated": bool(getattr(finding, "validated", False)),
+    }
+
+
+# Fields the list view needs — keep the /issues payload light (request/response
+# bodies can be large); the full record is fetched per-issue via /issues/detail.
+_ISSUE_SUMMARY_FIELDS = ("id", "title", "severity", "confidence", "host", "path",
+                         "url", "module", "origin", "highlight", "validated",
+                         "discovered_at")
+
+
+class _IssueStore:
+    """Per-project issue list, persisted to ``<project>/issues.json``.
+
+    Disk-backed with no long-lived cache (issue volume is modest and ops are
+    low-frequency), so it can't drift from a project that was deleted out from
+    under it — a removed project's workspace dir (and its issues.json) is gone,
+    and this simply reads an empty list. All read-modify-write ops hold one
+    lock, so the scan thread adding findings and the HTTP thread editing/listing
+    never corrupt the file.
+    """
+
+    def __init__(self, projects: "_ProjectStore"):
+        self._projects = projects
+        self._lock = threading.Lock()
+
+    def _file(self, pid: Any) -> Path:
+        return self._projects.workspace_dir(pid) / "issues.json"
+
+    def _read(self, pid: Any) -> Dict[str, Any]:
+        try:
+            d = json.loads(self._file(pid).read_text())
+            d.setdefault("issues", [])
+            d.setdefault("next_id", 1)
+            return d
+        except Exception:
+            return {"issues": [], "next_id": 1}
+
+    def _write(self, pid: Any, data: Dict[str, Any]) -> None:
+        try:
+            self._file(pid).write_text(json.dumps(data, indent=2, default=str))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _key(issue: Dict[str, Any]) -> str:
+        # Issue identity (for dedup): a scanner re-emitting the same finding, or
+        # the post-run completion sweep re-seeing a live-captured one, must NOT
+        # create a second issue — and must NOT clobber a user's re-triage.
+        return "␟".join((issue.get("title", ""), issue.get("url", ""),
+                              issue.get("parameter", ""), issue.get("module", "")))
+
+    def add_finding(self, pid: Any, finding: Any, scanner: str, origin: str) -> Optional[Dict[str, Any]]:
+        """Add a finding as a new issue; returns the issue summary, or None if a
+        matching issue already exists (idempotent, so live capture + the
+        completion sweep never double-count and edits are preserved)."""
+        issue = _finding_to_issue(finding, scanner, origin)
+        key = self._key(issue)
+        with self._lock:
+            data = self._read(pid)
+            for existing in data["issues"]:
+                if existing.get("key") == key:
+                    return None
+            issue["id"] = data["next_id"]
+            issue["key"] = key
+            issue["highlight"] = None
+            issue["discovered_at"] = time.time()
+            data["next_id"] += 1
+            data["issues"].append(issue)
+            self._write(pid, data)
+            return {k: issue.get(k) for k in _ISSUE_SUMMARY_FIELDS}
+
+    def list(self, pid: Any) -> List[Dict[str, Any]]:
+        with self._lock:
+            data = self._read(pid)
+        return [{k: i.get(k) for k in _ISSUE_SUMMARY_FIELDS} for i in data["issues"]]
+
+    def count(self, pid: Any) -> int:
+        with self._lock:
+            return len(self._read(pid)["issues"])
+
+    def get(self, pid: Any, issue_id: Any) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            data = self._read(pid)
+        for i in data["issues"]:
+            if str(i.get("id")) == str(issue_id):
+                return i
+        return None
+
+    def update(self, pid: Any, issue_id: Any, severity: Optional[str] = None,
+               highlight: Optional[str] = None) -> Dict[str, Any]:
+        with self._lock:
+            data = self._read(pid)
+            for i in data["issues"]:
+                if str(i.get("id")) == str(issue_id):
+                    if severity is not None:
+                        sev = severity.lower().strip()
+                        if sev not in _VALID_SEVERITIES:
+                            return {"ok": False, "error": f"invalid severity '{severity}'"}
+                        i["severity"] = sev
+                    if highlight is not None:
+                        color = highlight.lower().strip()
+                        if color not in _HIGHLIGHT_COLORS:
+                            return {"ok": False, "error": f"invalid highlight '{highlight}'"}
+                        i["highlight"] = None if color == "none" else color
+                    self._write(pid, data)
+                    return {"ok": True, "issue": {k: i.get(k) for k in _ISSUE_SUMMARY_FIELDS}}
+            return {"ok": False, "error": "no such issue"}
+
+    def delete(self, pid: Any, issue_id: Any) -> Dict[str, Any]:
+        with self._lock:
+            data = self._read(pid)
+            before = len(data["issues"])
+            data["issues"] = [i for i in data["issues"] if str(i.get("id")) != str(issue_id)]
+            if len(data["issues"]) == before:
+                return {"ok": False, "error": "no such issue"}
+            self._write(pid, data)
+            return {"ok": True}
+
+    def clear(self, pid: Any) -> Dict[str, Any]:
+        with self._lock:
+            data = self._read(pid)
+            data["issues"] = []
+            self._write(pid, data)
+        return {"ok": True}
+
+
 # ── Shell page ───────────────────────────────────────────────────────────────
 # Left project rail + top tab bar (Dashboard | Auth | Ghost); panes swap
 # client-side. Theme-aware, inline CSS/JS, no external requests.
@@ -581,6 +784,77 @@ _PAGE = r"""<!doctype html>
     border:0; cursor:pointer; padding:2px 6px; border-radius:4px; }
   .scope-item button:hover { color:var(--red); background:var(--bg); }
   .scope-empty { padding:14px 12px; color:var(--muted); font-size:12.5px; }
+
+  /* ── Issues tab (Burp-style) ── */
+  nav button .badge { display:none; margin-left:6px; min-width:16px; padding:0 5px; border-radius:9px;
+    background:var(--red); color:#fff; font-size:10.5px; font-weight:700; line-height:16px; text-align:center; }
+  nav button .badge.show { display:inline-block; }
+  #pane-issues.active { display:flex; flex-direction:column; overflow:hidden; }
+  .iss-toolbar { display:flex; align-items:center; gap:14px; padding:8px 14px; border-bottom:1px solid var(--border);
+    background:var(--panel); flex-shrink:0; font-size:12px; color:var(--muted); }
+  .iss-toolbar b { color:var(--fg); }
+  .iss-toolbar .spacer { flex:1; }
+  .iss-toolbar select { font:inherit; font-size:12px; color:var(--fg); background:var(--bg);
+    border:1px solid var(--border); border-radius:5px; padding:3px 6px; }
+  .iss-toolbar a { color:var(--accent); cursor:pointer; }
+  .iss-split { flex:1; min-height:0; display:flex; flex-direction:column; }
+  .iss-list-wrap { flex:1 1 55%; min-height:80px; overflow:auto; }
+  .iss-detail-wrap { flex:1 1 45%; min-height:120px; border-top:1px solid var(--border);
+    display:flex; flex-direction:column; overflow:hidden; }
+  table.iss { width:100%; border-collapse:collapse; font-size:12.5px; }
+  table.iss thead th { position:sticky; top:0; background:var(--panel); text-align:left; padding:7px 10px;
+    border-bottom:1px solid var(--border); cursor:pointer; user-select:none; white-space:nowrap; color:var(--muted); font-weight:600; }
+  table.iss thead th:hover { color:var(--fg); }
+  table.iss thead th .arrow { color:var(--accent); }
+  table.iss tbody td { padding:6px 10px; border-bottom:1px solid var(--border); vertical-align:top; }
+  table.iss tbody tr { cursor:pointer; }
+  table.iss tbody tr:hover { background:var(--bg); }
+  table.iss tbody tr.sel { background:rgba(63,208,214,.14); }
+  table.iss tbody tr.hl-red { box-shadow:inset 3px 0 0 #ff5f57; }
+  table.iss tbody tr.hl-orange { box-shadow:inset 3px 0 0 #ff9f43; }
+  table.iss tbody tr.hl-yellow { box-shadow:inset 3px 0 0 #f7c948; }
+  table.iss tbody tr.hl-green { box-shadow:inset 3px 0 0 #28c840; }
+  table.iss tbody tr.hl-blue { box-shadow:inset 3px 0 0 #5aa9ff; }
+  table.iss tbody tr.hl-purple { box-shadow:inset 3px 0 0 #b98cff; }
+  table.iss tbody tr.hl-gray { box-shadow:inset 3px 0 0 #8a94a6; }
+  .sev { display:inline-block; padding:1px 7px; border-radius:4px; font-size:10.5px; font-weight:700;
+    text-transform:uppercase; letter-spacing:.03em; color:#08131a; }
+  .sev.critical { background:#ff5f57; color:#fff; } .sev.high { background:#ff9f43; }
+  .sev.medium { background:#f7c948; } .sev.low { background:#5aa9ff; } .sev.info { background:#8a94a6; color:#fff; }
+  .conf { color:var(--muted); font-size:11.5px; }
+  .iss-empty { padding:24px; color:var(--muted); font-size:13px; text-align:center; }
+  .iss-dtabs { display:flex; gap:2px; padding:6px 12px 0; border-bottom:1px solid var(--border); flex-shrink:0; }
+  .iss-dtabs button { font:inherit; font-size:12px; color:var(--muted); background:transparent; border:none;
+    border-bottom:2px solid transparent; padding:6px 12px; cursor:pointer; }
+  .iss-dtabs button:hover { color:var(--fg); }
+  .iss-dtabs button.active { color:var(--fg); border-bottom-color:var(--accent); }
+  .iss-detail { flex:1; min-height:0; overflow:auto; padding:14px 18px; font-size:12.5px; }
+  .iss-detail h3 { font-size:14px; margin:0 0 4px; }
+  .iss-detail .kv { color:var(--muted); margin-bottom:12px; }
+  .iss-detail .kv b { color:var(--fg); }
+  .iss-detail section { margin-bottom:14px; }
+  .iss-detail section > .lbl { font-weight:700; color:var(--accent); font-size:11px; text-transform:uppercase;
+    letter-spacing:.04em; margin-bottom:4px; }
+  .iss-detail pre { margin:0; padding:10px 12px; background:var(--panel); border:1px solid var(--border);
+    border-radius:6px; overflow:auto; max-height:340px; white-space:pre-wrap; word-break:break-word; font-size:12px; }
+  .iss-detail ul { margin:4px 0; padding-left:20px; }
+  .iss-detail a { color:var(--blue); word-break:break-all; }
+  .iss-detail .none { color:var(--muted); font-style:italic; }
+  /* Issue right-click menu (severity / highlight / delete) */
+  .iss-ctx { position:fixed; z-index:70; display:none; background:var(--panel); border:1px solid var(--border);
+    border-radius:8px; padding:6px; min-width:190px; box-shadow:0 10px 30px rgba(0,0,0,.4); font-size:12.5px; }
+  .iss-ctx .lbl { color:var(--muted); font-size:10.5px; text-transform:uppercase; letter-spacing:.04em; padding:5px 8px 3px; }
+  .iss-ctx .opts { display:flex; flex-wrap:wrap; gap:4px; padding:0 6px 6px; }
+  .iss-ctx .opts button { font:inherit; font-size:11px; padding:3px 8px; border-radius:4px; border:1px solid var(--border);
+    background:var(--bg); color:var(--fg); cursor:pointer; }
+  .iss-ctx .opts button:hover { border-color:var(--accent); }
+  .iss-ctx .sw { display:inline-block; width:16px; height:16px; border-radius:4px; border:1px solid rgba(0,0,0,.3);
+    cursor:pointer; }
+  .iss-ctx .sw:hover { outline:2px solid var(--accent); }
+  .iss-ctx hr { border:0; border-top:1px solid var(--border); margin:5px 4px; }
+  .iss-ctx .del { display:block; width:100%; text-align:left; font:inherit; font-size:12.5px; color:var(--red);
+    background:transparent; border:0; padding:6px 8px; border-radius:4px; cursor:pointer; }
+  .iss-ctx .del:hover { background:var(--bg); }
 </style>
 </head>
 <body>
@@ -594,6 +868,7 @@ _PAGE = r"""<!doctype html>
   <div class="workspace">
     <nav>
       <button data-tab="dashboard" class="active">Dashboard</button>
+      <button data-tab="issues">Issues<span id="issues-badge" class="badge"></span></button>
       <button data-tab="scope">Scope</button>
       <button data-tab="auth">Auth</button>
       <button data-tab="ghost">Ghost</button>
@@ -637,6 +912,46 @@ _PAGE = r"""<!doctype html>
               <span class="term-title" id="h-term-title">beatrix@hunt</span>
             </div>
             <div id="hunt-log" class="terminal"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="pane-issues" class="pane">
+        <div class="iss-toolbar">
+          <span>Project <b id="iss-project">—</b></span>
+          <span><b id="iss-count">0</b> issue(s)</span>
+          <span class="spacer"></span>
+          <label>Sort by
+            <select id="iss-sort">
+              <option value="severity">Severity</option>
+              <option value="title">Issue type</option>
+              <option value="host">Host</option>
+              <option value="path">URL / path</option>
+              <option value="module">Module</option>
+              <option value="confidence">Confidence</option>
+              <option value="discovered_at">Time found</option>
+            </select>
+          </label>
+          <a id="iss-clear" title="Delete all issues in this project">clear all</a>
+        </div>
+        <div class="iss-split">
+          <div class="iss-list-wrap">
+            <table class="iss">
+              <thead><tr id="iss-head"></tr></thead>
+              <tbody id="iss-body"></tbody>
+            </table>
+            <div id="iss-empty" class="iss-empty">No issues yet — run a Hunt or Ghost scan and findings appear here.</div>
+          </div>
+          <div class="iss-detail-wrap">
+            <div class="iss-dtabs" id="iss-dtabs">
+              <button data-dt="advisory" class="active">Advisory</button>
+              <button data-dt="request">Request</button>
+              <button data-dt="response">Response</button>
+              <button data-dt="poc">PoC</button>
+            </div>
+            <div id="iss-detail" class="iss-detail">
+              <div class="none">Select an issue to view its details.</div>
+            </div>
           </div>
         </div>
       </section>
@@ -696,6 +1011,7 @@ _PAGE = r"""<!doctype html>
   </div>
 </div>
 <div id="ctxmenu" class="ctx"><button id="ctx-del">Delete project</button></div>
+<div id="issue-ctx" class="iss-ctx"></div>
 <div id="mod-tooltip" class="mod-tooltip"></div>
 <script>
 const TAGS = { thinking:"🧠 thinking", system_prompt:"📋 system", prompt:"📤 prompt",
@@ -715,6 +1031,7 @@ document.querySelectorAll("nav button").forEach(btn => {
       $("pane-auth").innerHTML = '<iframe src="/auth" title="Beatrix Auth"></iframe>';
       authLoaded = true;
     }
+    if (tab === "issues") loadIssuesFor(activeProject);   // freshen on view
   };
 });
 
@@ -1128,6 +1445,179 @@ $("scope-clear").onclick = async () => {
   if (r.ok) renderScopeList(r.scope);
 };
 
+// ── Issues: Burp-style master/detail. Every finding from a Hunt or Ghost run
+// becomes a persistent, per-project issue you can inspect, re-triage, highlight
+// or delete. The list is disk-backed on the server; the client mirrors it and
+// re-fetches on tab/project switch and on a light poll so new findings appear
+// live as a scan runs.
+const SEV_RANK = { critical:0, high:1, medium:2, low:3, info:4 };
+const HL_COLORS = { red:"#ff5f57", orange:"#ff9f43", yellow:"#f7c948", green:"#28c840",
+  blue:"#5aa9ff", purple:"#b98cff", gray:"#8a94a6" };
+const ISS_COLS = [
+  { key:"severity", label:"Severity" }, { key:"title", label:"Issue" },
+  { key:"host", label:"Host" }, { key:"path", label:"Path" },
+  { key:"module", label:"Module" }, { key:"confidence", label:"Confidence" },
+];
+let issuesData = [], issueSort = { key:"severity", dir:1 }, selectedIssue = null;
+let issueDetailTab = "advisory", issueDetail = null;
+
+function cmpIssues(a, b) {
+  const k = issueSort.key;
+  let av, bv;
+  if (k === "severity") { av = SEV_RANK[a.severity] ?? 9; bv = SEV_RANK[b.severity] ?? 9; }
+  else if (k === "discovered_at") { av = a.discovered_at || 0; bv = b.discovered_at || 0; }
+  else { av = String(a[k] || "").toLowerCase(); bv = String(b[k] || "").toLowerCase(); }
+  if (av < bv) return -1 * issueSort.dir;
+  if (av > bv) return 1 * issueSort.dir;
+  return (a.id - b.id);   // stable tiebreak by discovery order
+}
+function renderIssueHead() {
+  const tr = $("iss-head"); tr.innerHTML = "";
+  for (const c of ISS_COLS) {
+    const th = document.createElement("th");
+    const arrow = issueSort.key === c.key ? ` <span class="arrow">${issueSort.dir > 0 ? "▲" : "▼"}</span>` : "";
+    th.innerHTML = c.label + arrow;
+    th.onclick = () => {
+      if (issueSort.key === c.key) issueSort.dir *= -1; else { issueSort.key = c.key; issueSort.dir = 1; }
+      $("iss-sort").value = issueSort.key;
+      renderIssues();
+    };
+    tr.appendChild(th);
+  }
+}
+function renderIssues() {
+  renderIssueHead();
+  const body = $("iss-body"); body.innerHTML = "";
+  const rows = issuesData.slice().sort(cmpIssues);
+  $("iss-count").textContent = issuesData.length;
+  $("iss-empty").style.display = rows.length ? "none" : "block";
+  for (const it of rows) {
+    const tr = document.createElement("tr");
+    if (it.highlight) tr.className = "hl-" + it.highlight;
+    if (selectedIssue === it.id) tr.className += " sel";
+    tr.innerHTML =
+      `<td><span class="sev ${esc(it.severity)}">${esc(it.severity)}</span></td>` +
+      `<td>${esc(it.title)}</td><td>${esc(it.host)}</td><td>${esc(it.path)}</td>` +
+      `<td>${esc(it.module)}</td><td class="conf">${esc(it.confidence)}</td>`;
+    tr.onclick = () => selectIssue(it.id);
+    tr.oncontextmenu = (e) => { e.preventDefault(); showIssueCtx(e, it.id); };
+    body.appendChild(tr);
+  }
+}
+function updateIssueBadge(n) {
+  const b = $("issues-badge");
+  b.textContent = n; b.classList.toggle("show", n > 0);
+}
+async function loadIssuesFor(id) {
+  $("iss-project").textContent = (projects.find(p => p.id === id) || {}).name || "—";
+  let list = [];
+  try { list = (await (await fetch("/issues?project=" + id)).json()).issues || []; } catch (e) {}
+  if (id !== activeProject) return;      // switched away while fetching
+  issuesData = list;
+  updateIssueBadge(list.length);
+  if (selectedIssue !== null && !list.some(i => i.id === selectedIssue)) {
+    selectedIssue = null; issueDetail = null; renderIssueDetail();
+  }
+  renderIssues();
+}
+async function selectIssue(id) {
+  selectedIssue = id;
+  renderIssues();
+  try { issueDetail = (await (await fetch("/issues/detail?project=" + activeProject + "&id=" + id)).json()).issue; }
+  catch (e) { issueDetail = null; }
+  renderIssueDetail();
+}
+function fld(label, val, opts) {
+  opts = opts || {};
+  if (!val || (Array.isArray(val) && !val.length)) {
+    return opts.hideEmpty ? "" : `<section><div class="lbl">${esc(label)}</div><div class="none">—</div></section>`;
+  }
+  let inner;
+  if (opts.pre) inner = `<pre>${esc(val)}</pre>`;
+  else if (opts.links) inner = "<ul>" + val.map(u =>
+    /^https?:\/\//.test(u) ? `<li><a href="${esc(u)}" target="_blank" rel="noopener">${esc(u)}</a></li>` : `<li>${esc(u)}</li>`).join("") + "</ul>";
+  else if (opts.list) inner = "<ul>" + val.map(s => `<li>${esc(s)}</li>`).join("") + "</ul>";
+  else inner = `<div>${esc(val)}</div>`;
+  return `<section><div class="lbl">${esc(label)}</div>${inner}</section>`;
+}
+function renderIssueDetail() {
+  const box = $("iss-detail");
+  const d = issueDetail;
+  if (!d) { box.innerHTML = '<div class="none">Select an issue to view its details.</div>'; return; }
+  if (issueDetailTab === "advisory") {
+    box.innerHTML =
+      `<h3>${esc(d.title)}</h3>` +
+      `<div class="kv"><span class="sev ${esc(d.severity)}">${esc(d.severity)}</span> · ` +
+      `confidence <b>${esc(d.confidence)}</b> · module <b>${esc(d.module)}</b> · ` +
+      `found by <b>${esc(d.origin === "ghost" ? "Ghost agent" : "Hunt")}</b>${d.validated ? " · <b>validated</b>" : ""}</div>` +
+      `<div class="kv">URL: <b>${esc(d.url || "—")}</b>${d.parameter ? " · parameter <b>" + esc(d.parameter) + "</b>" : ""}</div>` +
+      fld("Description", d.description) + fld("Impact", d.impact) + fld("Remediation", d.remediation) +
+      fld("Classifications", [d.cwe, d.owasp].filter(Boolean), { list:true, hideEmpty:true }) +
+      fld("References / documentation", d.references, { links:true });
+  } else if (issueDetailTab === "request") {
+    box.innerHTML = fld("HTTP request", d.request, { pre:true });
+  } else if (issueDetailTab === "response") {
+    box.innerHTML = fld("HTTP response", d.response, { pre:true });
+  } else {   // poc
+    box.innerHTML =
+      fld("Evidence", d.evidence, { pre:true }) +
+      fld("Payload", d.payload, { pre:true, hideEmpty:true }) +
+      fld("curl PoC", d.poc_curl, { pre:true, hideEmpty:true }) +
+      fld("Python PoC", d.poc_python, { pre:true, hideEmpty:true }) +
+      fld("Reproduction steps", d.reproduction_steps, { list:true });
+  }
+}
+document.querySelectorAll("#iss-dtabs button").forEach(b => {
+  b.onclick = () => {
+    document.querySelectorAll("#iss-dtabs button").forEach(x => x.classList.toggle("active", x === b));
+    issueDetailTab = b.dataset.dt; renderIssueDetail();
+  };
+});
+$("iss-sort").onchange = () => { issueSort.key = $("iss-sort").value; issueSort.dir = 1; renderIssues(); };
+$("iss-clear").onclick = async () => {
+  if (!issuesData.length) return;
+  if (!confirm("Delete all " + issuesData.length + " issue(s) in this project?")) return;
+  await fetch("/issues/clear", { method:"POST", body: JSON.stringify({ project: activeProject }) });
+  selectedIssue = null; issueDetail = null; renderIssueDetail();
+  loadIssuesFor(activeProject);
+};
+
+// Right-click menu: set severity / highlight / delete.
+function showIssueCtx(e, id) {
+  const m = $("issue-ctx");
+  const sevBtns = Object.keys(SEV_RANK).map(s =>
+    `<button data-act="sev" data-v="${s}">${s}</button>`).join("");
+  const swatches = Object.entries(HL_COLORS).map(([name, col]) =>
+    `<span class="sw" title="${name}" style="background:${col}" data-act="hl" data-v="${name}"></span>`).join("") +
+    `<button data-act="hl" data-v="none" style="font-size:11px; padding:1px 6px;">none</button>`;
+  m.innerHTML =
+    `<div class="lbl">Set severity</div><div class="opts">${sevBtns}</div>` +
+    `<div class="lbl">Highlight</div><div class="opts">${swatches}</div>` +
+    `<hr><button class="del" data-act="del">Delete issue</button>`;
+  m.dataset.iid = id;
+  m.style.display = "block"; m.style.left = e.clientX + "px"; m.style.top = e.clientY + "px";
+  // keep the menu on-screen
+  const r = m.getBoundingClientRect();
+  if (r.right > innerWidth) m.style.left = (innerWidth - r.width - 6) + "px";
+  if (r.bottom > innerHeight) m.style.top = (innerHeight - r.height - 6) + "px";
+  m.querySelectorAll("[data-act]").forEach(el => {
+    el.onclick = async (ev) => {
+      ev.stopPropagation();
+      const act = el.dataset.act, v = el.dataset.v;
+      $("issue-ctx").style.display = "none";
+      if (act === "del") {
+        await fetch("/issues/delete", { method:"POST", body: JSON.stringify({ project: activeProject, id }) });
+        if (selectedIssue === id) { selectedIssue = null; issueDetail = null; renderIssueDetail(); }
+      } else {
+        const patch = { project: activeProject, id };
+        if (act === "sev") patch.severity = v; else patch.highlight = v;
+        await fetch("/issues/update", { method:"POST", body: JSON.stringify(patch) });
+      }
+      loadIssuesFor(activeProject);
+    };
+  });
+}
+
 // ── Projects: left rail (switch / create / delete) ──
 let projects = [], activeProject = null;
 function renderProjects() {
@@ -1169,6 +1659,8 @@ function onProjectSwitch() {
   loadGhostViewFor(activeProject);
   loadHuntViewFor(activeProject);
   loadScopeFor(activeProject);
+  selectedIssue = null; issueDetail = null; renderIssueDetail();
+  loadIssuesFor(activeProject);
 }
 
 // Context menu
@@ -1177,17 +1669,30 @@ function showCtx(e, id) {
   m.style.display = "block"; m.style.left = e.clientX + "px"; m.style.top = e.clientY + "px";
   m.dataset.pid = id;
 }
-document.addEventListener("click", () => { $("ctxmenu").style.display = "none"; });
+document.addEventListener("click", () => {
+  $("ctxmenu").style.display = "none"; $("issue-ctx").style.display = "none";
+});
 $("ctx-del").onclick = () => {
   const id = parseInt($("ctxmenu").dataset.pid, 10);
   $("ctxmenu").style.display = "none";
   deleteProject(id);
 };
 
+// Live refresh: keep the Issues badge current everywhere, and the list current
+// while it's the visible tab, so findings appear as a scan discovers them.
+setInterval(() => {
+  if (activeProject === null) return;
+  const onIssues = document.querySelector('nav button[data-tab="issues"]').classList.contains("active");
+  if (onIssues) { loadIssuesFor(activeProject); return; }
+  fetch("/issues/count?project=" + activeProject).then(r => r.json())
+    .then(d => updateIssueBadge(d.count || 0)).catch(() => {});
+}, 2000);
+
 loadHuntCatalog();
 loadProjects().then(() => {
-  loadGhostViewFor(activeProject); loadHuntViewFor(activeProject); loadScopeFor(activeProject);
-});  // restore any run in progress + the active project's scope on load/refresh
+  loadGhostViewFor(activeProject); loadHuntViewFor(activeProject);
+  loadScopeFor(activeProject); loadIssuesFor(activeProject);
+});  // restore any run in progress + the active project's scope/issues on load/refresh
 </script>
 </body>
 </html>"""
@@ -1204,6 +1709,9 @@ class SuiteServer:
         self.url: str = ""
         self.public_url: Optional[str] = None
         self.projects = _ProjectStore(Path(state_dir) if state_dir else DEFAULT_STATE_DIR)
+        # Per-project issue log (Burp-style): every finding from Hunt or Ghost
+        # lands here for inspection / re-triage / highlight / delete.
+        self.issues = _IssueStore(self.projects)
         # One ghost run + event broker PER project (keyed by str(project id)), so
         # switching projects preserves each project's live run view.
         self.ghost_brokers: Dict[str, _Broker] = {}
@@ -1261,6 +1769,15 @@ class SuiteServer:
         with self._lock:
             self.ghost_brokers[key] = broker
 
+        # Live Issues-tab capture: every finding the agent records (root or any
+        # subagent) streams into this project's issue log with full detail.
+        def _capture(finding: Any) -> None:
+            try:
+                self.issues.add_finding(project_id, finding,
+                                        getattr(finding, "scanner_module", "") or "ghost2", "ghost")
+            except Exception:
+                pass
+
         def _run() -> None:
             import asyncio
             loop = asyncio.new_event_loop()
@@ -1268,12 +1785,17 @@ class SuiteServer:
             task = loop.create_task(run_investigation(
                 target, cfg=cfg, objective=objective,
                 allowed_hosts=allowed_hosts,
-                on_event=broker.emit, persist=True,
+                on_event=broker.emit, on_finding=_capture, persist=True,
             ))
             with self._lock:
                 self.ghost_tasks[key] = (loop, task)
             try:
                 result = loop.run_until_complete(task)
+                # Completion backstop: sweep the authoritative final findings
+                # into the issue log (idempotent — the live sink already added
+                # most; dedup keeps this from double-counting).
+                for f in (result.get("findings") or []):
+                    _capture(f)
                 broker.emit({"type": "verdict", "text": result.get("verdict", "done"),
                              "detail": result.get("final_output") or ""})
             except asyncio.CancelledError:
@@ -1370,6 +1892,15 @@ class SuiteServer:
                     host = urlparse(url).hostname or url
                     broker.emit({"type": "info", "text": f"⚠ Skipped out-of-scope finding on {host}"})
                     return
+            # Live Issues-tab capture: an in-scope finding becomes an issue the
+            # moment the scanner reports it (Burp-style), with full detail.
+            if event == "finding":
+                f = data.get("finding")
+                if f is not None:
+                    try:
+                        self.issues.add_finding(project_id, f, data.get("scanner", "") or "", "hunt")
+                    except Exception:
+                        pass
             line = _hunt_event_to_line(event, data)
             if line is not None:
                 broker.emit(line)
@@ -1553,6 +2084,25 @@ class SuiteServer:
                     if proj is None:
                         proj = suite.projects.state().get("active")
                     self._json({"scope": suite.projects.get_scope(proj)})
+                elif path == "/issues":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json({"issues": suite.issues.list(proj)})
+                elif path == "/issues/count":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json({"count": suite.issues.count(proj)})
+                elif path == "/issues/detail":
+                    q = parse_qs(urlparse(self.path).query)
+                    proj = (q.get("project") or [None])[0]
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    iid = (q.get("id") or [None])[0]
+                    self._json({"issue": suite.issues.get(proj, iid)})
                 else:
                     self._send(404, b"not found", "text/plain")
 
@@ -1613,6 +2163,24 @@ class SuiteServer:
                     if proj is None:
                         proj = suite.projects.state().get("active")
                     self._json(suite.projects.clear_scope(proj))
+                elif path == "/issues/update":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.issues.update(
+                        proj, payload.get("id"),
+                        severity=payload.get("severity"),
+                        highlight=payload.get("highlight")))
+                elif path == "/issues/delete":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.issues.delete(proj, payload.get("id")))
+                elif path == "/issues/clear":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.issues.clear(proj))
                 elif path == "/projects/new":
                     self._json(suite.projects.new())
                 elif path == "/projects/select":
