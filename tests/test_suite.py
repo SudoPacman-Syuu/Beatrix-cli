@@ -579,3 +579,112 @@ def test_start_hunt_run_filters_out_of_scope_findings(server, monkeypatch):
     assert "excluded from the final report" in texts
     finding_events = [e for e in events if e["type"] == "finding"]
     assert len(finding_events) == 1  # the evil.com finding never became a terminal line
+
+
+# ── Stop button: cancel an in-flight Ghost/Hunt run on demand ────────────
+def test_stop_ghost_run_when_nothing_running(server):
+    code, r = _post(server, "/ghost/stop", {"project": 1})
+    assert code == 200
+    assert r["ok"] is False
+    assert "no scan running" in r["error"].lower()
+
+
+def test_stop_hunt_run_when_nothing_running(server):
+    code, r = _post(server, "/hunt/stop", {"project": 1})
+    assert code == 200
+    assert r["ok"] is False
+    assert "no scan running" in r["error"].lower()
+
+
+def test_ghost_stop_cancels_in_flight_run(server, monkeypatch):
+    import asyncio
+    import time
+
+    import beatrix.ai.ghost2.config as config_mod
+    import beatrix.ai.ghost2.core.runner as runner_mod
+
+    async def fake_run_investigation(target, **kwargs):
+        await asyncio.Event().wait()  # blocks forever unless the task is cancelled
+
+    monkeypatch.setattr(runner_mod, "run_investigation", fake_run_investigation)
+    monkeypatch.setattr(config_mod.GhostV2Config, "missing_key_message", lambda self: None)
+    monkeypatch.setattr(config_mod.GhostV2Config, "load",
+                         staticmethod(lambda: config_mod.GhostV2Config(model="openrouter/x/y", api_key="k")))
+
+    assert server.start_ghost_run("https://example.com", "find bugs", 1)["ok"] is True
+
+    for _ in range(50):
+        if "1" in server.ghost_tasks:
+            break
+        time.sleep(0.05)
+    assert "1" in server.ghost_tasks
+
+    assert server.stop_ghost_run(1) == {"ok": True}
+
+    broker = server.ghost_brokers["1"]
+    for _ in range(50):
+        if broker.since(10**9)["done"]:
+            break
+        time.sleep(0.05)
+    events = broker.since(0)["events"]
+    assert events[-1]["type"] == "verdict" and events[-1]["text"] == "stopped"
+    assert "1" not in server.ghost_tasks  # cleaned up after teardown
+
+
+def test_hunt_stop_cancels_in_flight_run(server, monkeypatch):
+    import asyncio
+    import time
+
+    from beatrix.core.types import Finding, Severity
+
+    async def fake_hunt(self, target, preset, ai, modules, scope=None):
+        self.findings = [Finding(title="partial", url=target, severity=Severity.LOW)]
+        await asyncio.Event().wait()  # blocks forever unless the task is cancelled
+
+    import beatrix.core.engine as engine_mod
+    monkeypatch.setattr(engine_mod.BeatrixEngine, "hunt", fake_hunt)
+
+    assert server.start_hunt_run("https://example.com", ["injection"], "custom", False, 1)["ok"] is True
+
+    for _ in range(50):
+        if "1" in server.hunt_tasks:
+            break
+        time.sleep(0.05)
+    assert "1" in server.hunt_tasks
+
+    assert server.stop_hunt_run(1) == {"ok": True}
+
+    broker = server.hunt_brokers["1"]
+    for _ in range(50):
+        if broker.since(10**9)["done"]:
+            break
+        time.sleep(0.05)
+    events = broker.since(0)["events"]
+    assert events[-1]["type"] == "verdict" and events[-1]["text"] == "stopped"
+    assert "1 finding" in events[-1]["detail"]
+    assert "1" not in server.hunt_tasks
+
+
+def test_stop_route_defaults_to_active_project(server, monkeypatch):
+    import asyncio
+    import time
+
+    import beatrix.ai.ghost2.config as config_mod
+    import beatrix.ai.ghost2.core.runner as runner_mod
+
+    async def fake_run_investigation(target, **kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(runner_mod, "run_investigation", fake_run_investigation)
+    monkeypatch.setattr(config_mod.GhostV2Config, "missing_key_message", lambda self: None)
+    monkeypatch.setattr(config_mod.GhostV2Config, "load",
+                         staticmethod(lambda: config_mod.GhostV2Config(model="openrouter/x/y", api_key="k")))
+
+    _post(server, "/ghost/run", {"target": "https://example.com", "project": 1})
+    for _ in range(50):
+        if "1" in server.ghost_tasks:
+            break
+        time.sleep(0.05)
+
+    code, r = _post(server, "/ghost/stop", {})  # no project -> active project (1)
+    assert code == 200 and r["ok"] is True

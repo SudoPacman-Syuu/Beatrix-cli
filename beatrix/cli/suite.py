@@ -255,6 +255,29 @@ def _host_in_scope(url_or_host: str, hosts: List[str]) -> bool:
     return Scope(target="", allowed_hosts=hosts).in_scope(url_or_host)
 
 
+def _shutdown_loop(loop) -> None:
+    """Cancel any tasks still pending on ``loop`` and close it.
+
+    Mirrors what ``asyncio.run`` does on the way out. Needed because a
+    stoppable run manages its own loop (instead of using ``asyncio.run``)
+    so its task can be cancelled from another thread via
+    ``loop.call_soon_threadsafe(task.cancel)`` when the user hits Stop.
+    """
+    import asyncio
+    try:
+        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        for t in pending:
+            t.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.run_until_complete(loop.shutdown_asyncgens())
+    except Exception:
+        pass
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
 def _parse_scope_text(raw: str) -> List[str]:
     """Split a pasted blob (newline/comma/whitespace-separated) into
     normalized, deduplicated hostnames, dropping anything unparseable."""
@@ -484,6 +507,9 @@ _PAGE = r"""<!doctype html>
   button.run { font:inherit; color:#08131a; background:var(--accent); border:0; border-radius:6px;
     padding:8px 16px; cursor:pointer; font-weight:600; }
   button.run:disabled { opacity:.5; cursor:default; }
+  button.stop { font:inherit; color:#fff; background:var(--red); border:0; border-radius:6px;
+    padding:8px 16px; cursor:pointer; font-weight:600; }
+  button.stop:disabled { opacity:.4; cursor:default; }
   .ghost-toolbar { display:flex; align-items:center; gap:16px; margin:10px 0 4px;
     color:var(--muted); font-size:12px; }
   .ghost-toolbar b { color:var(--fg); }
@@ -593,6 +619,7 @@ _PAGE = r"""<!doctype html>
           <div class="modules" id="h-modules"></div>
 
           <button id="h-run" class="run" style="width:100%; margin-top:14px;">▶ Begin Scan</button>
+          <button id="h-stop" class="stop" style="width:100%; margin-top:8px;" disabled>■ Stop Scan</button>
           <div id="h-msg" style="color:var(--muted); font-size:12px; margin-top:8px;"></div>
         </aside>
 
@@ -652,6 +679,7 @@ _PAGE = r"""<!doctype html>
             <div><label>Target</label><input id="g-target" type="text" placeholder="https://example.com"></div>
             <div><label>Objective (optional)</label><input id="g-obj" type="text" placeholder="Find and validate security vulnerabilities."></div>
             <button id="g-run" class="run">Run</button>
+            <button id="g-stop" class="stop" disabled>■ Stop</button>
           </div>
           <div id="g-msg" style="color:var(--muted); font-size:12px;"></div>
           <div class="ghost-toolbar">
@@ -721,8 +749,9 @@ async function poll(id) {
   $("g-count").textContent = since;
   if (autoscroll) $("ghost-log").scrollTop = $("ghost-log").scrollHeight;
   if (ghostStarted) $("g-elapsed").textContent = Math.round(Date.now()/1000 - ghostStarted) + "s";
-  if (r.done) { $("g-run").disabled = false; $("g-msg").textContent = "Run finished."; return; }
-  $("g-run").disabled = true;
+  if (r.done) { $("g-run").disabled = false; $("g-stop").disabled = true;
+    $("g-msg").textContent = "Run finished."; return; }
+  $("g-run").disabled = true; $("g-stop").disabled = false;
   setTimeout(() => poll(id), 600);
 }
 // Rebuild the Ghost pane for `id`: clear the shared log DOM, then replay that
@@ -733,7 +762,7 @@ async function loadGhostViewFor(id) {
   $("ghost-log").innerHTML = ""; since = 0; ghostTools = 0; ghostStarted = null;
   $("g-count").textContent = "0"; $("g-tools").textContent = "0"; $("g-elapsed").textContent = "0s";
   pollProject = id;
-  $("g-run").disabled = false; $("g-msg").textContent = "";
+  $("g-run").disabled = false; $("g-stop").disabled = true; $("g-msg").textContent = "";
   let st = {};
   try { st = await (await fetch("/ghost/state?project=" + id)).json(); } catch (e) {}
   if (id !== pollProject) return;                 // switched again while loading
@@ -741,6 +770,7 @@ async function loadGhostViewFor(id) {
     $("g-target").value = st.target;
     $("g-obj").value = st.objective || "";
     ghostStarted = st.started || null;
+    $("g-run").disabled = !!st.running; $("g-stop").disabled = !st.running;
     $("g-msg").textContent = st.running ? "Running: " + st.target : "Run finished.";
     poll(id);                                     // replays history; keeps going if still running
   } else {
@@ -758,9 +788,18 @@ $("g-run").onclick = async () => {
     const r = await (await fetch("/ghost/run", { method:"POST",
       body: JSON.stringify({ target, objective: $("g-obj").value.trim(), project: activeProject }) })).json();
     if (!r.ok) { $("g-msg").textContent = "Error: " + (r.error || "could not start"); $("g-run").disabled = false; return; }
+    $("g-stop").disabled = false;
     $("g-msg").textContent = "Running: " + target;
     poll(activeProject);
   } catch (e) { $("g-msg").textContent = "Error: " + e; $("g-run").disabled = false; }
+};
+$("g-stop").onclick = async () => {
+  $("g-stop").disabled = true; $("g-msg").textContent = "Stopping…";
+  try {
+    const r = await (await fetch("/ghost/stop", { method:"POST",
+      body: JSON.stringify({ project: activeProject }) })).json();
+    if (!r.ok) { $("g-msg").textContent = "Error: " + (r.error || "could not stop"); $("g-stop").disabled = false; }
+  } catch (e) { $("g-msg").textContent = "Error: " + e; $("g-stop").disabled = false; }
 };
 
 $("g-autoscroll").onclick = () => {
@@ -853,15 +892,16 @@ async function hPoll(id) {
   $("h-count").textContent = hSince;
   if (hAutoscroll) $("hunt-log").scrollTop = $("hunt-log").scrollHeight;
   if (hStarted) $("h-elapsed").textContent = Math.round(Date.now()/1000 - hStarted) + "s";
-  if (r.done) { $("h-run").disabled = false; $("h-msg").textContent = "Run finished."; return; }
-  $("h-run").disabled = true;
+  if (r.done) { $("h-run").disabled = false; $("h-stop").disabled = true;
+    $("h-msg").textContent = "Run finished."; return; }
+  $("h-run").disabled = true; $("h-stop").disabled = false;
   setTimeout(() => hPoll(id), 600);
 }
 async function loadHuntViewFor(id) {
   $("hunt-log").innerHTML = ""; hSince = 0; hFindings = 0; hStarted = null;
   $("h-count").textContent = "0"; $("h-findings").textContent = "0"; $("h-elapsed").textContent = "0s";
   hPollProject = id;
-  $("h-run").disabled = false; $("h-msg").textContent = "";
+  $("h-run").disabled = false; $("h-stop").disabled = true; $("h-msg").textContent = "";
   let st = {};
   try { st = await (await fetch("/hunt/state?project=" + id)).json(); } catch (e) {}
   if (id !== hPollProject) return;
@@ -869,6 +909,7 @@ async function loadHuntViewFor(id) {
   $("h-term-title").textContent = "beatrix@hunt — " + (ap ? ap.name : "project " + id);
   if (st && st.target) {
     hStarted = st.started || null;
+    $("h-run").disabled = !!st.running; $("h-stop").disabled = !st.running;
     $("h-msg").textContent = st.running ? "Running: " + st.target : "Run finished.";
     hPoll(id);
   }
@@ -974,9 +1015,18 @@ $("h-run").onclick = async () => {
       project: activeProject,
     }) })).json();
     if (!r.ok) { $("h-msg").textContent = "Error: " + (r.error || "could not start"); $("h-run").disabled = false; return; }
+    $("h-stop").disabled = false;
     $("h-msg").textContent = "Running: " + target;
     hPoll(activeProject);
   } catch (e) { $("h-msg").textContent = "Error: " + e; $("h-run").disabled = false; }
+};
+$("h-stop").onclick = async () => {
+  $("h-stop").disabled = true; $("h-msg").textContent = "Stopping…";
+  try {
+    const r = await (await fetch("/hunt/stop", { method:"POST",
+      body: JSON.stringify({ project: activeProject }) })).json();
+    if (!r.ok) { $("h-msg").textContent = "Error: " + (r.error || "could not stop"); $("h-stop").disabled = false; }
+  } catch (e) { $("h-msg").textContent = "Error: " + e; $("h-stop").disabled = false; }
 };
 
 function saveHuntHtml() {
@@ -1159,6 +1209,10 @@ class SuiteServer:
         self.ghost_brokers: Dict[str, _Broker] = {}
         # Same per-project isolation for Hunt (the deterministic scanner pipeline).
         self.hunt_brokers: Dict[str, _Broker] = {}
+        # (loop, task) for each in-flight run, keyed the same way, so the Stop
+        # button can cancel a run from the HTTP handler thread.
+        self.ghost_tasks: Dict[str, Any] = {}
+        self.hunt_tasks: Dict[str, Any] = {}
         self._lock = threading.Lock()
 
     # ── Ghost run lifecycle ──────────────────────────────────────────────
@@ -1209,22 +1263,50 @@ class SuiteServer:
 
         def _run() -> None:
             import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            task = loop.create_task(run_investigation(
+                target, cfg=cfg, objective=objective,
+                allowed_hosts=allowed_hosts,
+                on_event=broker.emit, persist=True,
+            ))
+            with self._lock:
+                self.ghost_tasks[key] = (loop, task)
             try:
-                result = asyncio.run(run_investigation(
-                    target, cfg=cfg, objective=objective,
-                    allowed_hosts=allowed_hosts,
-                    on_event=broker.emit, persist=True,
-                ))
+                result = loop.run_until_complete(task)
                 broker.emit({"type": "verdict", "text": result.get("verdict", "done"),
                              "detail": result.get("final_output") or ""})
+            except asyncio.CancelledError:
+                broker.emit({"type": "verdict", "text": "stopped",
+                             "detail": "Scan stopped by user."})
             except Exception as e:  # noqa: BLE001 — surface any failure to the pane
                 broker.emit({"type": "verdict", "text": "error",
                              "detail": f"{type(e).__name__}: {e}"})
             finally:
+                _shutdown_loop(loop)
+                with self._lock:
+                    self.ghost_tasks.pop(key, None)
                 broker.finish()
 
         threading.Thread(target=_run, daemon=True).start()
         return {"ok": True, "target": target}
+
+    def stop_ghost_run(self, project_id: Any) -> Dict[str, Any]:
+        """Cancel the in-flight GHOST run for ``project_id``, if any.
+
+        Cancelling the task raises ``asyncio.CancelledError`` at its current
+        await point — since that's a ``BaseException``, not ``Exception``, it
+        passes straight through every broad ``except Exception`` in the run
+        (session/agent teardown still happens via their own ``finally``
+        blocks) and is caught here as a distinct "stopped" outcome.
+        """
+        with self._lock:
+            entry = self.ghost_tasks.get(str(project_id))
+        if entry is None:
+            return {"ok": False, "error": "No scan running for this project."}
+        loop, task = entry
+        loop.call_soon_threadsafe(task.cancel)
+        return {"ok": True}
 
     def ghost_events(self, since: int, project_id: Any) -> Dict[str, Any]:
         b = self.ghost_brokers.get(str(project_id))
@@ -1299,29 +1381,31 @@ class SuiteServer:
             from beatrix.core.engine import BeatrixEngine, EngineConfig
             from beatrix.core.scan_output import ScanOutputManager
 
+            output_mgr = None
             try:
-                output_mgr = None
-                try:
-                    output_mgr = ScanOutputManager(
-                        target, base_dir=self.projects.workspace_dir(project_id))
-                except Exception:
-                    pass
+                output_mgr = ScanOutputManager(
+                    target, base_dir=self.projects.workspace_dir(project_id))
+            except Exception:
+                pass
 
-                engine = BeatrixEngine(config=EngineConfig(), on_event=_on_event,
-                                       output_manager=output_mgr)
+            engine = BeatrixEngine(config=EngineConfig(), on_event=_on_event,
+                                   output_manager=output_mgr)
+            crawler_scope = _expand_for_crawler(scope_hosts) if scope_hosts else None
 
-                crawler_scope = _expand_for_crawler(scope_hosts) if scope_hosts else None
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            # preset="full" always opens every phase (1-7), so an arbitrary,
+            # cross-category module selection can never be silently blocked
+            # by a narrower preset's phase gate — the explicit `modules` list
+            # is what actually restricts which scanners run (see kill_chain's
+            # per-scanner filter above).
+            task = loop.create_task(engine.hunt(target=target, preset="full", ai=ai,
+                                                modules=modules, scope=crawler_scope))
+            with self._lock:
+                self.hunt_tasks[key] = (loop, task)
 
-                async def _go():
-                    # preset="full" always opens every phase (1-7), so an
-                    # arbitrary, cross-category module selection can never be
-                    # silently blocked by a narrower preset's phase gate — the
-                    # explicit `modules` list is what actually restricts which
-                    # scanners run (see kill_chain's per-scanner filter above).
-                    return await engine.hunt(target=target, preset="full", ai=ai,
-                                              modules=modules, scope=crawler_scope)
-
-                state = asyncio.run(_go())
+            try:
+                state = loop.run_until_complete(task)
 
                 # Scope backstop #2: the same filter as _on_event above, but
                 # against the final, deduplicated findings list — covers
@@ -1360,14 +1444,34 @@ class SuiteServer:
                 broker.emit({"type": "verdict",
                              "text": f"Hunt complete — {n} finding{'s' if n != 1 else ''}",
                              "detail": detail})
+            except asyncio.CancelledError:
+                n = len(engine.findings)
+                broker.emit({"type": "verdict", "text": "stopped",
+                             "detail": f"Scan stopped by user — {n} finding{'s' if n != 1 else ''} "
+                                       "recorded before stop."})
             except Exception as e:  # noqa: BLE001 — surface any failure to the pane
                 broker.emit({"type": "verdict", "text": "error",
                              "detail": f"{type(e).__name__}: {e}"})
             finally:
+                _shutdown_loop(loop)
+                with self._lock:
+                    self.hunt_tasks.pop(key, None)
                 broker.finish()
 
         threading.Thread(target=_run, daemon=True).start()
         return {"ok": True, "target": target}
+
+    def stop_hunt_run(self, project_id: Any) -> Dict[str, Any]:
+        """Cancel the in-flight Hunt scan for ``project_id``, if any (see
+        ``stop_ghost_run`` for why ``asyncio.CancelledError`` cleanly
+        distinguishes a user-requested stop from a real error)."""
+        with self._lock:
+            entry = self.hunt_tasks.get(str(project_id))
+        if entry is None:
+            return {"ok": False, "error": "No scan running for this project."}
+        loop, task = entry
+        loop.call_soon_threadsafe(task.cancel)
+        return {"ok": True}
 
     def hunt_events(self, since: int, project_id: Any) -> Dict[str, Any]:
         b = self.hunt_brokers.get(str(project_id))
@@ -1473,6 +1577,11 @@ class SuiteServer:
                         proj = suite.projects.state().get("active")
                     self._json(suite.start_ghost_run(
                         payload.get("target", ""), payload.get("objective", ""), proj))
+                elif path == "/ghost/stop":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.stop_ghost_run(proj))
                 elif path == "/hunt/run":
                     proj = payload.get("project")
                     if proj is None:
@@ -1480,6 +1589,11 @@ class SuiteServer:
                     self._json(suite.start_hunt_run(
                         payload.get("target", ""), payload.get("modules") or [],
                         payload.get("preset", "custom"), bool(payload.get("ai")), proj))
+                elif path == "/hunt/stop":
+                    proj = payload.get("project")
+                    if proj is None:
+                        proj = suite.projects.state().get("active")
+                    self._json(suite.stop_hunt_run(proj))
                 elif path == "/scope/add":
                     proj = payload.get("project")
                     if proj is None:
